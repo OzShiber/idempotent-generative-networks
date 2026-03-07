@@ -9,7 +9,7 @@ from utils import imwrite, find_latest_checkpoint
 from data import mnist_denormalize as denorm
 import wandb
 from song__unet import creat_song_unet
-from new_arch import InvUnetV2
+# from new_arch import InvUnetV2
 
 
 class LinearIGN(nn.Module):
