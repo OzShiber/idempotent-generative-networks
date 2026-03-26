@@ -9,7 +9,8 @@ from utils import imwrite, find_latest_checkpoint
 from data import mnist_denormalize as denorm
 import wandb
 from song__unet import creat_song_unet
-# from new_arch import InvUnetV2
+import csv
+from inv_Unet import InvUnetV2
 
 
 class LinearIGN(nn.Module):
@@ -21,8 +22,8 @@ class LinearIGN(nn.Module):
         
         # Invertible network 'g'
         # self.g = InvTransformerNet(conf.n_heads, conf.n_layers, conf.p_sz, self.conf.im_shape[-1], rgb=(self.conf.im_shape[0] == 3))
-        self.g = InvCNNNet(conf.n_layers, conf.im_shape[-1])
-        # self.g = InvUnetV2(6, 1, 32, creat_song_unet)
+        # self.g = InvCNNNet(conf.n_layers, conf.im_shape[-1])
+        self.g = InvUnetV2(6, 1, 32, creat_song_unet)
         
         # Idempotent linear operator 'A'
         input_dim = self.conf.im_shape[0] * self.conf.im_shape[1] * self.conf.im_shape[2]
@@ -101,6 +102,12 @@ class LinearIGN(nn.Module):
                     avg_tight = running_tight / counter
                     print(f"[Train] Epoch [{epoch+1}/{n_epochs}] Batch [{batch_idx+1}/{num_batches}] "
                           f"LR: {current_lr:.6f} | Loss: {avg_loss:.4f} | Rec: {avg_rec:.4f} | Sparse: {avg_sparse:.4f}| tight: {avg_tight:.4f}")
+                    metrics = {
+                    'step': global_counter, 'epoch': epoch+1, 'lr': current_lr,
+                    'loss': avg_loss, 'rec': avg_rec, 'sparse': avg_sparse, 'tight': avg_tight
+                    }
+                    self.log_local_metrics(metrics)
+
                     if self.conf.wandb:
                         wandb.log({
                             'LR': current_lr, 'loss': avg_loss,
@@ -161,4 +168,13 @@ class LinearIGN(nn.Module):
             print(f"Loaded checkpoint from {ckpt_file}")
         except FileNotFoundError:
             print(f"Checkpoint file not found: {ckpt_file}")
-
+    
+    def log_local_metrics(self, metrics):
+    
+        log_path = os.path.join(self.conf.exp_dir, "metrics.csv")
+        file_exists = os.path.isfile(log_path)
+        with open(log_path, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=metrics.keys())
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(metrics)

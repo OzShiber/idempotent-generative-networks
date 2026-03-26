@@ -3,7 +3,7 @@ import os, torch
 import torchvision.transforms as T
 from torchvision.utils import save_image
 from lin_ign import IGN  # adjust import
-from utils import find_latest_checkpoint
+from utils import find_latest_checkpoint, make_ign_inputs
 
 
 def main(conf):
@@ -11,7 +11,7 @@ def main(conf):
     model = IGN(conf).to(device)
     model.load_checkpoint(conf.ckpt)  # implement load
 
-    inputs = make_inputs(size=conf.img_size)
+    inputs = make_ign_inputs(size=conf.img_size)
 
     os.makedirs(conf.out_dir, exist_ok=True)
     for name, x in inputs.items():

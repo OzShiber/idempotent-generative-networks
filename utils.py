@@ -7,6 +7,8 @@ from torchvision.utils import make_grid
 from PIL import Image
 import numpy as np
 from collections import OrderedDict
+import pandas as pd
+import matplotlib.pyplot as plt
 
 def imread(fname, bounds=(-1, 1), **kwargs):
     from PIL import Image
@@ -293,3 +295,24 @@ def make_ign_inputs(data_loader, size=32):
 
 
     return inputs
+
+
+def plot_experiment_comparison(exp_dir1, exp_dir2, label1="CNN", label2="UNet"):
+    df1 = pd.read_csv(os.path.join(exp_dir1, "metrics.csv"))
+    df2 = pd.read_csv(os.path.join(exp_dir2, "metrics.csv"))
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    metrics_to_plot = ['rec', 'sparse', 'tight']
+    titles = ['Reconstruction Loss', 'Sparsity (A diag mean)', 'Tightness Loss']
+
+    for i, metric in enumerate(metrics_to_plot):
+        axes[i].plot(df1['step'], df1[metric], label=label1, alpha=0.7)
+        axes[i].plot(df2['step'], df2[metric], label=label2, alpha=0.7)
+        axes[i].set_title(titles[i])
+        axes[i].set_xlabel('Global Step')
+        axes[i].legend()      
+        axes[i].grid(True, linestyle='--', alpha=0.6)
+
+    plt.tight_layout()
+    plt.savefig("comparison_plot.png")
+    plt.show()

@@ -71,6 +71,7 @@ def main():
     
     # --- Experiment folder handling ---
     exp_dir, ckpt_dir, grid_dir = create_experiment_dirs_ign(conf.results_dir, conf.dataset, conf.exp_name)
+    conf.exp_dir = exp_dir
     conf.ckpt_dir = ckpt_dir
     conf.grid_dir = grid_dir
     print(f"Experiment directory: {exp_dir}")
