@@ -22,8 +22,8 @@ class LinearIGN(nn.Module):
         
         # Invertible network 'g'
         # self.g = InvTransformerNet(conf.n_heads, conf.n_layers, conf.p_sz, self.conf.im_shape[-1], rgb=(self.conf.im_shape[0] == 3))
-        # self.g = InvCNNNet(conf.n_layers, conf.im_shape[-1])
-        self.g = InvUnetV2(6, 1, 32, creat_song_unet)
+        self.g = InvCNNNet(conf.n_layers, conf.im_shape[-1])
+        #self.g = InvUnetV2(6, 1, 32, creat_song_unet)
         
         # Idempotent linear operator 'A'
         input_dim = self.conf.im_shape[0] * self.conf.im_shape[1] * self.conf.im_shape[2]
