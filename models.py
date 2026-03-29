@@ -629,32 +629,30 @@ class IdempotentDiagonalOperator(nn.Module):
         x_flat = x.view(x.shape[0], -1)
         
         ## Get binary diagonal using the STE trick
-        #probs = self.logits.sigmoid()
-        #self.diag = probs.round().detach() + probs - probs.detach()
-        #self.probs = probs
+        probs = self.logits.sigmoid()
+        self.diag = probs.round().detach() + probs - probs.detach()
+        self.probs = probs
 
 
-        #Use Rotation Trick (Gumble-Sigmoid)
-        tau = 0.5  # Temperature parameter (Start at 1.0 or 0.5, ideally anneal to 0.1 over training)
+        # #Use Rotation Trick (Gumble-Sigmoid)
+        # tau = 0.5  # Temperature parameter (Start at 1.0 or 0.5, ideally anneal to 0.1 over training)
 
-        if self.training:
-            # 1. Sample Gumbel noise (exploration)
-            U = torch.rand_like(self.logits)
-            gumbel_noise = -torch.log(-torch.log(U + 1e-20) + 1e-20)
-        else:
-            # No noise during testing/inference
-            gumbel_noise = 0.0
+        # if self.training:
+        #     # 1. Sample Gumbel noise (exploration)
+        #     U = torch.rand_like(self.logits)
+        #     gumbel_noise = -torch.log(-torch.log(U + 1e-20) + 1e-20)
+        # else:
+        #     # No noise during testing/inference
+        #     gumbel_noise = 0.0
 
-        # 2. Calculate the "Soft" probability using noise and temperature
-        y_soft = torch.sigmoid((self.logits + gumbel_noise) / tau)
+        # # 2. Calculate the "Soft" probability using noise and temperature
+        # y_soft = torch.sigmoid((self.logits + gumbel_noise) / tau)
 
-        # 3. Calculate the "Hard" binary mask (strict 0s and 1s for Idempotency)
-        y_hard = y_soft.round()
+        # # 3. Calculate the "Hard" binary mask (strict 0s and 1s for Idempotency)
+        # y_hard = y_soft.round()
 
-        # 4. The Advanced STE: Use hard values for the math, but soft gradients for the learning
-        self.diag = y_hard.detach() - y_soft.detach() + y_soft
-        is_binary = torch.all((self.diag == 0.0) | (self.diag == 1.0))
-        print(f"Math check: Is diag strictly 0 and 1? {is_binary.item()}")
+        # # 4. The Advanced STE: Use hard values for the math, but soft gradients for the learning
+        # self.diag = y_hard.detach() - y_soft.detach() + y_soft
 
         # Apply diagonal matrix A to the flattened latent vector g(x)
         y_flat = x_flat * self.diag

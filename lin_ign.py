@@ -48,8 +48,17 @@ class LinearIGN(nn.Module):
     def train_step(self, x, z):
         # concat a zero vector to the end of x
         fx, gx, _ = self(x, ret_intermid=True)
+    
+        # # Feed the generated image (fx) right back in
+        # ffx, _, _ = self(fx.detach(), ret_intermid=True)
+
+        # # Measure how much the pixels shifted on the second trip
+        # idem_gap = torch.nn.functional.mse_loss(ffx, fx.detach())
+        # print(f"Idem Gap: {idem_gap.item():.6f}")
+    
         zero = self.g.inverse(torch.zeros_like(x[:1]))
         loss_rec = (fx - x).abs().mean()
+    
         # loss_sparse = (self.A.diag.mean() - loss_rec.detach()).relu()
         loss_sparse = self.A.diag.mean()
 
