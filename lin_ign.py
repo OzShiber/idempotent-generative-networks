@@ -85,6 +85,11 @@ class LinearIGN(nn.Module):
         
         print("--- Starting Training for LinearIGN ---")
         for epoch in range(n_epochs):
+            
+            # Gradually increase tight loss after epoch 5
+            current_tight = min(1.0, 0.2 * (epoch - 5)) if epoch >= 5 else 0.0
+            self.conf.lambda_tight = current_tight
+
             running_loss, running_rec, running_sparse, running_tight = 0.0, 0.0, 0.0, 0.0
             counter = 0
             num_batches = len(train_loader)
