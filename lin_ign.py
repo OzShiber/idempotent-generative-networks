@@ -48,21 +48,16 @@ class LinearIGN(nn.Module):
     def train_step(self, x, z):
         # concat a zero vector to the end of x
         fx, gx, _ = self(x, ret_intermid=True)
-    
-        # # Feed the generated image (fx) right back in
-        # ffx, _, _ = self(fx.detach(), ret_intermid=True)
-
-        # # Measure how much the pixels shifted on the second trip
-        # idem_gap = torch.nn.functional.mse_loss(ffx, fx.detach())
-        # print(f"Idem Gap: {idem_gap.item():.6f}")
-    
-        zero = self.g.inverse(torch.zeros_like(x[:1]))
-        loss_rec = (fx - x).abs().mean()
-    
-        # loss_sparse = (self.A.diag.mean() - loss_rec.detach()).relu()
+        
+        # Upgraded to L1 loss for sharpness
+        loss_rec = torch.nn.functional.l1_loss(fx, x)
+                
+        # Sparsity
         loss_sparse = self.A.diag.mean()
 
-        loss_tight= (gx.pow(2).mean((1, 2, 3)) - (x - zero).pow(2).mean((1, 2, 3))).abs().mean()
+        # Tightness
+        zero = self.g.inverse(torch.zeros_like(x[:1]))
+        loss_tight = (gx.pow(2).mean((1, 2, 3)) - (x - zero).pow(2).mean((1, 2, 3))).abs().mean()
              
         total_loss = (self.conf.lambda_rec * loss_rec + 
                       self.conf.lambda_sparse * loss_sparse +
@@ -86,9 +81,8 @@ class LinearIGN(nn.Module):
         print("--- Starting Training for LinearIGN ---")
         for epoch in range(n_epochs):
             
-            # Gradually increase tight loss after epoch 5
-            current_tight = min(1.0, 0.2 * (epoch - 5)) if epoch >= 5 else 0.0
-            self.conf.lambda_tight = current_tight
+            # Locking lambda at 0.0001
+            self.conf.lambda_tight = 0.0001
 
             running_loss, running_rec, running_sparse, running_tight = 0.0, 0.0, 0.0, 0.0
             counter = 0

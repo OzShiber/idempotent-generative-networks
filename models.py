@@ -286,18 +286,18 @@ class InvCNNNet(nn.Module):
 
 
 class CNNBlock(nn.Module):
-    def __init__(self, hidden_chans, in_chans=2, k_sz=2, bias=True):
+    def __init__(self, hidden_chans, in_chans=2, k_sz=4, bias=True):
         super().__init__()
-        self.layer_1 = (nn.Conv2d(2, 8, k_sz, 2, 0, bias=bias))
-        self.layer_2 = (nn.Conv2d(8, 32, k_sz, 2, 0, bias=bias))
-        self.bn_1 = (nn.BatchNorm2d(32))        
-        self.layer_3 = (nn.Conv2d(32, 128, k_sz, 2, 0, bias=bias))
-        self.layer_4 = (nn.Conv2d(128,512, k_sz, 2, 0, bias=bias))
-        self.layer_5 = (nn.ConvTranspose2d(512, 128, k_sz, 2, 0))
-        self.layer_6 = (nn.ConvTranspose2d(128, 32, k_sz, 2, 0))
-        self.bn_2 = (nn.BatchNorm2d(32))        
-        self.layer_7 = (nn.ConvTranspose2d(32, 8, k_sz, 2, 0))
-        self.layer_8 = (nn.ConvTranspose2d(8, 2, k_sz, 2, 0))
+        self.layer_1 = (nn.Conv2d(in_chans, hidden_chans // 4, k_sz, 2, 1, bias=bias))
+        self.layer_2 = (nn.Conv2d(hidden_chans // 4, hidden_chans, k_sz, 2, 1, bias=bias))
+        self.bn_1 = (nn.BatchNorm2d(hidden_chans))        
+        self.layer_3 = (nn.Conv2d(hidden_chans, hidden_chans * 4, k_sz, 2, 1, bias=bias))
+        self.layer_4 = (nn.Conv2d(hidden_chans * 4, hidden_chans * 16, k_sz, 2, 1, bias=bias))
+        self.layer_5 = (nn.ConvTranspose2d(hidden_chans * 16, hidden_chans * 4, k_sz, 2, 1))
+        self.layer_6 = (nn.ConvTranspose2d(hidden_chans * 4, hidden_chans, k_sz, 2, 1))
+        self.bn_2 = (nn.BatchNorm2d(hidden_chans))
+        self.layer_7 = (nn.ConvTranspose2d(hidden_chans, hidden_chans // 4, k_sz, 2, 1))
+        self.layer_8 = (nn.ConvTranspose2d(hidden_chans // 4, in_chans, k_sz, 2, 1))
         
     def forward(self, x):
         x1 = self.layer_1(x) 
@@ -347,9 +347,8 @@ class ActNorm2d(nn.Module):
 class InvCNNBlock(nn.Module):
     def __init__(self, im_sz):
         super().__init__()
-        self.norm = ActNorm2d(1024)
-        self.F = CNNBlock(512)
-        self.G = CNNBlock(512)
+        self.F = CNNBlock(hidden_chans=128)
+        self.G = CNNBlock(hidden_chans=128)
 
     def forward(self, X_1, X_2):
         Y_1 = (X_1 + self.F(X_2))
