@@ -646,6 +646,57 @@ class BasicLinearizer(nn.Module):
 
 
 
+class RotationTrickEstimator(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x_cont):
+        # 1. The Forward Pass: Snap to discrete binary mask (just like STE)
+        x_disc = x_cont.round()
+        
+        # Save tensors for the backward pass
+        ctx.save_for_backward(x_cont, x_disc)
+        return x_disc
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x_cont, x_disc = ctx.saved_tensors
+        
+        # 1. Calculate norms (with epsilon to prevent division by zero)
+        eps = 1e-8
+        norm_cont = x_cont.norm(dim=-1, keepdim=True).clamp_min(eps)
+        norm_disc = x_disc.norm(dim=-1, keepdim=True).clamp_min(eps)
+        
+        # 2. Create unit vectors (u and v)
+        u = x_cont / norm_cont
+        v = x_disc / norm_disc
+        
+        # 3. Calculate cosine similarity between the vectors
+        c = (u * v).sum(dim=-1, keepdim=True)
+        
+        # --- Handle Edge Cases ---
+        # If the continuous vector was pushed to all zeros, or vectors are perfectly opposed, 
+        # rotation is undefined. Fallback safely to standard gradient.
+        invalid_mask = (norm_disc <= eps) | (c <= -1.0 + eps)
+        
+        # 4. Compute the implicit R^T * grad_output using dot products
+        # a = u \cdot g, b = v \cdot g
+        a = (u * grad_output).sum(dim=-1, keepdim=True)
+        b = (v * grad_output).sum(dim=-1, keepdim=True)
+        
+        # Algebraic expansion of the N-Dimensional rotation matrix transpose
+        c_u = b + (b * c - a) / (1 + c)
+        c_v = -a + (a * c - b) / (1 + c)
+        
+        grad_rotated = grad_output + (c_u * u) + (c_v * v)
+        
+        # 5. Apply the Scaling Factor (as per the paper's formulation)
+        grad_input = (norm_disc / norm_cont) * grad_rotated
+        
+        # Apply the fallback for invalid vectors (Dead Zero trap)
+        grad_input = torch.where(invalid_mask, grad_output, grad_input)
+        
+        return grad_input
+
+
 
 class IdempotentDiagonalOperator(nn.Module):
     def __init__(self, input_dim):
@@ -656,11 +707,14 @@ class IdempotentDiagonalOperator(nn.Module):
         # x shape: [B, C, H, W]
         original_shape = x.shape
         x_flat = x.view(x.shape[0], -1)
-        
-        ## Get binary diagonal using the STE trick
         probs = self.logits.sigmoid()
-        self.diag = probs.round().detach() + probs - probs.detach()
         self.probs = probs
+        
+        ## STE trick
+        #self.diag = probs.round().detach() + probs - probs.detach()
+
+        #Rotation Trick
+        self.diag = RotationTrickEstimator.apply(probs)
 
 
         # #Use Rotation Trick (Gumble-Sigmoid)
