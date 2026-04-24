@@ -285,25 +285,26 @@ class InvCNNNet(nn.Module):
         return Y
 
 
+#CNN V1
 class CNNBlock(nn.Module):
-    def __init__(self, hidden_chans, in_chans=2, k_sz=4, bias=True):
+    def __init__(self, hidden_chans, in_chans=2, k_sz=2, bias=True):
         super().__init__()
-        self.layer_1 = (nn.Conv2d(in_chans, hidden_chans // 4, k_sz, 2, 1, bias=bias))
-        self.layer_2 = (nn.Conv2d(hidden_chans // 4, hidden_chans, k_sz, 2, 1, bias=bias))
-        self.bn_1 = (nn.BatchNorm2d(hidden_chans))        
-        self.layer_3 = (nn.Conv2d(hidden_chans, hidden_chans * 4, k_sz, 2, 1, bias=bias))
-        self.layer_4 = (nn.Conv2d(hidden_chans * 4, hidden_chans * 16, k_sz, 2, 1, bias=bias))
-        self.layer_5 = (nn.ConvTranspose2d(hidden_chans * 16, hidden_chans * 4, k_sz, 2, 1))
-        self.layer_6 = (nn.ConvTranspose2d(hidden_chans * 4, hidden_chans, k_sz, 2, 1))
-        self.bn_2 = (nn.BatchNorm2d(hidden_chans))
-        self.layer_7 = (nn.ConvTranspose2d(hidden_chans, hidden_chans // 4, k_sz, 2, 1))
-        self.layer_8 = (nn.ConvTranspose2d(hidden_chans // 4, in_chans, k_sz, 2, 1))
-        
+        self.layer_1 = (nn.Conv2d(2, 8, k_sz, 2, 0, bias=bias))
+        self.layer_2 = (nn.Conv2d(8, 32, k_sz, 2, 0, bias=bias))
+        self.bn_1 = (nn.BatchNorm2d(32))
+        self.layer_3 = (nn.Conv2d(32, 128, k_sz, 2, 0, bias=bias))
+        self.layer_4 = (nn.Conv2d(128,512, k_sz, 2, 0, bias=bias))
+        self.layer_5 = (nn.ConvTranspose2d(512, 128, k_sz, 2, 0))
+        self.layer_6 = (nn.ConvTranspose2d(128, 32, k_sz, 2, 0))
+        self.bn_2 = (nn.BatchNorm2d(32))
+        self.layer_7 = (nn.ConvTranspose2d(32, 8, k_sz, 2, 0))
+        self.layer_8 = (nn.ConvTranspose2d(8, 2, k_sz, 2, 0))
+
     def forward(self, x):
-        x1 = self.layer_1(x) 
+        x1 = self.layer_1(x)
         x2 = self.layer_2(F.gelu(x1))
         # x2 = self.bn_1(x2)
-        x3 = self.layer_3(F.gelu(x2)) 
+        x3 = self.layer_3(F.gelu(x2))
         x4 = self.layer_4(F.gelu(x3))
         x5 = self.layer_5(F.gelu(x4))
         x6 = self.layer_6(F.gelu(x5))
@@ -312,6 +313,35 @@ class CNNBlock(nn.Module):
         x8 = self.layer_8(F.gelu(x7))
         return x8
 
+
+
+# CNN V2
+#class CNNBlock(nn.Module):
+    #def __init__(self, hidden_chans, in_chans=2, k_sz=4, bias=True):
+        #super().__init__()
+        #self.layer_1 = (nn.Conv2d(in_chans, hidden_chans // 4, k_sz, 2, 1, bias=bias))
+        #self.layer_2 = (nn.Conv2d(hidden_chans // 4, hidden_chans, k_sz, 2, 1, bias=bias))
+        #self.bn_1 = (nn.BatchNorm2d(hidden_chans))        
+        #self.layer_3 = (nn.Conv2d(hidden_chans, hidden_chans * 4, k_sz, 2, 1, bias=bias))
+        #self.layer_4 = (nn.Conv2d(hidden_chans * 4, hidden_chans * 16, k_sz, 2, 1, bias=bias))
+        #self.layer_5 = (nn.ConvTranspose2d(hidden_chans * 16, hidden_chans * 4, k_sz, 2, 1))
+        #self.layer_6 = (nn.ConvTranspose2d(hidden_chans * 4, hidden_chans, k_sz, 2, 1))
+        #self.bn_2 = (nn.BatchNorm2d(hidden_chans))
+        #self.layer_7 = (nn.ConvTranspose2d(hidden_chans, hidden_chans // 4, k_sz, 2, 1))
+        #self.layer_8 = (nn.ConvTranspose2d(hidden_chans // 4, in_chans, k_sz, 2, 1))
+        
+    #def forward(self, x):
+        #x1 = self.layer_1(x) 
+        #x2 = self.layer_2(F.gelu(x1))
+        # #x2 = self.bn_1(x2)
+        #x3 = self.layer_3(F.gelu(x2)) 
+        #x4 = self.layer_4(F.gelu(x3))
+        #x5 = self.layer_5(F.gelu(x4))
+        #x6 = self.layer_6(F.gelu(x5))
+        # #x6 = self.bn_2(x6)
+        #x7 = self.layer_7(F.gelu(x6))
+        #x8 = self.layer_8(F.gelu(x7))
+        #return x8
 
 
 class ActNorm2d(nn.Module):
@@ -577,7 +607,7 @@ class MLPBlock(nn.Module):
 class InvertibleMix(nn.Module):
     def __init__(self, M):
         super().__init__()
-        self.M = int(M)
+        scnn_L1_nobiaself.M = int(M)
         self.register_buffer("perm", torch.empty(0, dtype=torch.long))
 
     def forward(self, x1, x2):

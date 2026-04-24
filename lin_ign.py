@@ -23,7 +23,7 @@ class LinearIGN(nn.Module):
         # Invertible network 'g'
         # self.g = InvTransformerNet(conf.n_heads, conf.n_layers, conf.p_sz, self.conf.im_shape[-1], rgb=(self.conf.im_shape[0] == 3))
         self.g = InvCNNNet(conf.n_layers, conf.im_shape[-1])
-        #self.g = InvUnetV2(6, 1, 32, creat_song_unet)
+        #self.g = InvUnetV2(num_layers=1, in_channels=1, im_sz=32, unet_creator=creat_song_unet)
         
         # Idempotent linear operator 'A'
         input_dim = self.conf.im_shape[0] * self.conf.im_shape[1] * self.conf.im_shape[2]
@@ -52,6 +52,9 @@ class LinearIGN(nn.Module):
         # Upgraded to L1 loss for sharpness
         loss_rec = torch.nn.functional.l1_loss(fx, x)
                 
+        # Testing L2 Loss
+        #loss_rec = torch.nn.functional.mse_loss(fx, x)
+
         # Sparsity
         loss_sparse = self.A.diag.mean()
 
@@ -80,10 +83,7 @@ class LinearIGN(nn.Module):
         
         print("--- Starting Training for LinearIGN ---")
         for epoch in range(n_epochs):
-            
-            # Locking lambda at 0.0001
-            self.conf.lambda_tight = 0.0001
-
+                       
             running_loss, running_rec, running_sparse, running_tight = 0.0, 0.0, 0.0, 0.0
             counter = 0
             num_batches = len(train_loader)

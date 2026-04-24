@@ -1,0 +1,21 @@
+# Datasets
+data/
+dataset/
+
+# Model Checkpoints and Outputs
+results/
+*.pth
+*.pt
+
+# Logs
+wandb/
+logs/
+
+# Python Cache
+__pycache__/
+*.pyc
+
+#Slurm
+*.slurm
+*.out
+*.err
