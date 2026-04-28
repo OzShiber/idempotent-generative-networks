@@ -48,31 +48,37 @@ class LinearIGN(nn.Module):
     def train_step(self, x, z):
         # concat a zero vector to the end of x
         fx, gx, _ = self(x, ret_intermid=True)
-        
+
         # Upgraded to L1 loss for sharpness
         loss_rec = torch.nn.functional.l1_loss(fx, x)
-                
+
         # Testing L2 Loss
         #loss_rec = torch.nn.functional.mse_loss(fx, x)
 
         # Sparsity
-        loss_sparse = self.A.diag.mean()
+        loss_sparse = (self.A.diag.mean() - loss_rec.detach()).relu()
 
         # Tightness
         zero = self.g.inverse(torch.zeros_like(x[:1]))
         loss_tight = (gx.pow(2).mean((1, 2, 3)) - (x - zero).pow(2).mean((1, 2, 3))).abs().mean()
-             
-        total_loss = (self.conf.lambda_rec * loss_rec + 
+
+        # Denoising / projection signal: f should pull corrupted x back to x
+        x_noisy = (x + self.conf.noise_sigma * z).clamp(-1, 1)
+        fx_noisy = self(x_noisy)
+        loss_denoise = torch.nn.functional.l1_loss(fx_noisy, x)
+
+        total_loss = (self.conf.lambda_rec * loss_rec +
                       self.conf.lambda_sparse * loss_sparse +
-                      self.conf.lambda_tight * loss_tight)
-        
+                      self.conf.lambda_tight * loss_tight +
+                      self.conf.lambda_denoise * loss_denoise)
+
         self.opt.zero_grad()
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=0.1)
         self.opt.step()
 
 
-        return total_loss.item(), loss_rec.item(), loss_sparse.item(), loss_tight.item()
+        return total_loss.item(), loss_rec.item(), loss_sparse.item(), loss_tight.item(), loss_denoise.item()
 
     def train_model(self, train_loader, n_epochs):
         self.opt = optim.Adam(self.parameters(), lr=self.conf.lr, weight_decay=self.conf.weight_decay)
@@ -84,16 +90,16 @@ class LinearIGN(nn.Module):
         print("--- Starting Training for LinearIGN ---")
         for epoch in range(n_epochs):
                        
-            running_loss, running_rec, running_sparse, running_tight = 0.0, 0.0, 0.0, 0.0
+            running_loss, running_rec, running_sparse, running_tight, running_denoise = 0.0, 0.0, 0.0, 0.0, 0.0
             counter = 0
             num_batches = len(train_loader)
-            
+
             for batch_idx, (x, _) in enumerate(train_loader):
                 x = x.to(device)
                 z = torch.randn_like(x)
-                
-                loss, loss_rec, loss_sparse, loss_tight = self.train_step(x, z)
-                
+
+                loss, loss_rec, loss_sparse, loss_tight, loss_denoise = self.train_step(x, z)
+
                 B = x.shape[0]
                 counter += B
                 global_counter += 1
@@ -101,6 +107,7 @@ class LinearIGN(nn.Module):
                 running_rec += loss_rec * B
                 running_sparse += loss_sparse * B
                 running_tight += loss_tight * B
+                running_denoise += loss_denoise * B
 
                 if (global_counter) % self.conf.log_freq == 0:
                     current_lr = self.opt.param_groups[0]['lr']
@@ -108,11 +115,12 @@ class LinearIGN(nn.Module):
                     avg_rec = running_rec / counter
                     avg_sparse = running_sparse / counter
                     avg_tight = running_tight / counter
+                    avg_denoise = running_denoise / counter
                     print(f"[Train] Epoch [{epoch+1}/{n_epochs}] Batch [{batch_idx+1}/{num_batches}] "
-                          f"LR: {current_lr:.6f} | Loss: {avg_loss:.4f} | Rec: {avg_rec:.4f} | Sparse: {avg_sparse:.4f}| tight: {avg_tight:.4f}")
+                          f"LR: {current_lr:.6f} | Loss: {avg_loss:.4f} | Rec: {avg_rec:.4f} | Sparse: {avg_sparse:.4f} | tight: {avg_tight:.4f} | denoise: {avg_denoise:.4f}")
                     metrics = {
                     'step': global_counter, 'epoch': epoch+1, 'lr': current_lr,
-                    'loss': avg_loss, 'rec': avg_rec, 'sparse': avg_sparse, 'tight': avg_tight
+                    'loss': avg_loss, 'rec': avg_rec, 'sparse': avg_sparse, 'tight': avg_tight, 'denoise': avg_denoise
                     }
                     self.log_local_metrics(metrics)
 
@@ -121,10 +129,11 @@ class LinearIGN(nn.Module):
                             'LR': current_lr, 'loss': avg_loss,
                             'loss_rec': avg_rec,
                             'loss_sparse': avg_sparse,
-                            'loss tight': avg_tight
+                            'loss tight': avg_tight,
+                            'loss_denoise': avg_denoise
                         }, step=global_counter)
                     counter = 0
-                    running_loss, running_rec, running_sparse, running_tight = 0.0, 0.0, 0.0, 0.0
+                    running_loss, running_rec, running_sparse, running_tight, running_denoise = 0.0, 0.0, 0.0, 0.0, 0.0
             
             if (epoch + 1) % self.conf.val_freq == 0:
                 self.valid(epoch)

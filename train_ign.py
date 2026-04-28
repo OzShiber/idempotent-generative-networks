@@ -54,6 +54,8 @@ def main():
     parser.add_argument("--lambda_rec", type=float, default=1., help="Weight for the reconstruction loss.")
     parser.add_argument("--lambda_sparse", type=float, default=0.75, help="Weight for the A sparsity loss.")
     parser.add_argument("--lambda_tight", type=float, default=0.001, help="Weight for the A tightness loss.")
+    parser.add_argument("--lambda_denoise", type=float, default=1.0, help="Weight for the noisy-reconstruction (denoising) loss.")
+    parser.add_argument("--noise_sigma", type=float, default=0.3, help="Noise std added to x for the denoising loss.")
 
     conf = parser.parse_args()
     print(conf)
