@@ -27,7 +27,11 @@ class LinearIGN(nn.Module):
         
         # Idempotent linear operator 'A'
         input_dim = self.conf.im_shape[0] * self.conf.im_shape[1] * self.conf.im_shape[2]
-        self.A = IdempotentDiagonalOperator(input_dim)
+        self.A = IdempotentDiagonalOperator(
+            input_dim,
+            binarizer=getattr(self.conf, 'binarizer', 'rotation'),
+            gumbel_tau=getattr(self.conf, 'gumbel_tau', 0.5),
+        )
         
         # The complete Linearizer model f(x)
         self.model = BasicLinearizer(self.g, self.A)

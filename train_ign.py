@@ -49,6 +49,9 @@ def main():
     parser.add_argument("--n_layers", type=int, default=12, help="Number of layers in invertible network g.")
     parser.add_argument("--n_heads", type=int, default=4, help="Number of attention heads in g.")
     parser.add_argument("--p_sz", type=int, default=4, help="Patch size for invertible transformer g.")
+    parser.add_argument("--binarizer", type=str, choices=['rotation', 'ste', 'gumbel'], default='rotation',
+                        help="Gradient estimator for the binary diagonal A. 'rotation' = current default (RotationTrickEstimator). 'ste' = plain straight-through. 'gumbel' = Gumbel-sigmoid + STE.")
+    parser.add_argument("--gumbel_tau", type=float, default=0.5, help="Temperature for the gumbel binarizer (ignored for ste/rotation).")
 
     # Loss weights — defaults to 0 disable each auxiliary loss; the code paths still run for instrumentation.
     parser.add_argument("--lambda_rec", type=float, default=1., help="Weight for the reconstruction loss.")
