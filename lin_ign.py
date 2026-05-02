@@ -59,8 +59,12 @@ class LinearIGN(nn.Module):
         # Testing L2 Loss
         #loss_rec = torch.nn.functional.mse_loss(fx, x)
 
-        # Sparsity
-        loss_sparse = (self.A.diag.mean() - loss_rec.detach()).relu()
+        # Sparsity — flat: constant downward pressure on the diagonal proportional
+        # to the fraction of active dims. With STE this is what keeps A from
+        # collapsing toward identity. Under rotation trick the implicit norm-scaling
+        # already provides this pressure, so a flat formulation is redundant but
+        # not harmful (set lambda_sparse=0 to disable).
+        loss_sparse = self.A.diag.mean()
 
         # Tightness
         zero = self.g.inverse(torch.zeros_like(x[:1]))
