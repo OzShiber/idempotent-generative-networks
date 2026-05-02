@@ -50,35 +50,69 @@ class LinearIGN(nn.Module):
         return self.model(x, ret_intermid)
 
     def train_step(self, x, z):
-        # concat a zero vector to the end of x
+        # ret_intermid=True returns (y_pred, g_x, g_y_pred); g_x is g(x) already.
         fx, gx, _ = self(x, ret_intermid=True)
 
-        # Upgraded to L1 loss for sharpness
+        # --- L_rec: per-pixel L1 reconstruction. Median-seeking, so partly
+        # responsible for the model's blur — but switching to L2 is reliably worse.
         loss_rec = torch.nn.functional.l1_loss(fx, x)
 
         # Testing L2 Loss
         #loss_rec = torch.nn.functional.mse_loss(fx, x)
 
-        # Sparsity — flat: constant downward pressure on the diagonal proportional
-        # to the fraction of active dims. With STE this is what keeps A from
-        # collapsing toward identity. Under rotation trick the implicit norm-scaling
-        # already provides this pressure, so a flat formulation is redundant but
-        # not harmful (set lambda_sparse=0 to disable).
+        # --- L_sparse (flat): constant downward pressure on A.diag proportional
+        # to the fraction of active dims. Under STE this is what keeps A from
+        # collapsing toward identity; under rotation trick the implicit
+        # norm-scaling already provides this pressure, so a flat formulation
+        # is redundant but not harmful (set lambda_sparse=0 to disable).
         loss_sparse = self.A.diag.mean()
 
-        # Tightness
+        # --- L_tight: kept for instrumentation; lambda_tight=0 by default.
+        # Empirically this loss grows during training (opposite of intent) and
+        # has been shown to harm generation quality even at small weights.
         zero = self.g.inverse(torch.zeros_like(x[:1]))
         loss_tight = (gx.pow(2).mean((1, 2, 3)) - (x - zero).pow(2).mean((1, 2, 3))).abs().mean()
 
-        # Denoising / projection signal: f should pull corrupted x back to x
+        # --- L_denoise: f(x + sigma*z) should match x. Direct projection signal
+        # for f when fed non-real inputs. Empirically not strong enough on its own
+        # to drive useful generation; lambda_denoise=0 by default.
         x_noisy = (x + self.conf.noise_sigma * z).clamp(-1, 1)
         fx_noisy = self(x_noisy)
         loss_denoise = torch.nn.functional.l1_loss(fx_noisy, x)
 
+        # --- L_feat (Option 1a, latent feature matching): match g(x) and g(f(x))
+        # in addition to matching x and f(x) in pixel space.
+        #
+        # The motivation: pixel L1 is a single global average that can't distinguish
+        # "off by a smear of low-frequency error" from "off by sharp high-frequency
+        # errors with the same pixel-sum" — both look like the same number. g is a
+        # multi-scale invertible transform (each InvCNN layer halves spatial size
+        # and packs structure into channels), so L1(g(x), g(f(x))) penalises the
+        # difference at a coarser, more structural level. The model gets gradient
+        # signal not just from "did you reproduce each pixel" but also "did you
+        # reproduce the structure g learned to encode".
+        #
+        # Note: g is being trained simultaneously, so this loss can degenerate
+        # if g learns to be near-identity (then loss_feat collapses to loss_rec)
+        # or saturated (then loss_feat shrinks regardless of fidelity). In
+        # practice the other pressures (A's binary mask, L_rec) seem to keep g
+        # non-degenerate, but watch loss_feat behaviour during training.
+        #
+        # Cost: one extra forward through g (the call to self.g(fx) below).
+        # Disabled by default with lambda_feat=0.
+        if self.conf.lambda_feat > 0:
+            g_fx = self.g(fx)
+            loss_feat = torch.nn.functional.l1_loss(g_fx, gx)
+        else:
+            # Skip the extra forward when disabled — keep the metric for logging
+            # so its column in metrics.csv stays consistent.
+            loss_feat = torch.zeros((), device=x.device)
+
         total_loss = (self.conf.lambda_rec * loss_rec +
                       self.conf.lambda_sparse * loss_sparse +
                       self.conf.lambda_tight * loss_tight +
-                      self.conf.lambda_denoise * loss_denoise)
+                      self.conf.lambda_denoise * loss_denoise +
+                      self.conf.lambda_feat * loss_feat)
 
         self.opt.zero_grad()
         total_loss.backward()
@@ -86,7 +120,8 @@ class LinearIGN(nn.Module):
         self.opt.step()
 
 
-        return total_loss.item(), loss_rec.item(), loss_sparse.item(), loss_tight.item(), loss_denoise.item()
+        return (total_loss.item(), loss_rec.item(), loss_sparse.item(),
+                loss_tight.item(), loss_denoise.item(), loss_feat.item())
 
     def train_model(self, train_loader, n_epochs):
         self.opt = optim.Adam(self.parameters(), lr=self.conf.lr, weight_decay=self.conf.weight_decay)
@@ -98,7 +133,7 @@ class LinearIGN(nn.Module):
         print("--- Starting Training for LinearIGN ---")
         for epoch in range(n_epochs):
                        
-            running_loss, running_rec, running_sparse, running_tight, running_denoise = 0.0, 0.0, 0.0, 0.0, 0.0
+            running_loss, running_rec, running_sparse, running_tight, running_denoise, running_feat = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
             counter = 0
             num_batches = len(train_loader)
 
@@ -106,7 +141,7 @@ class LinearIGN(nn.Module):
                 x = x.to(device)
                 z = torch.randn_like(x)
 
-                loss, loss_rec, loss_sparse, loss_tight, loss_denoise = self.train_step(x, z)
+                loss, loss_rec, loss_sparse, loss_tight, loss_denoise, loss_feat = self.train_step(x, z)
 
                 B = x.shape[0]
                 counter += B
@@ -116,6 +151,7 @@ class LinearIGN(nn.Module):
                 running_sparse += loss_sparse * B
                 running_tight += loss_tight * B
                 running_denoise += loss_denoise * B
+                running_feat += loss_feat * B
 
                 if (global_counter) % self.conf.log_freq == 0:
                     current_lr = self.opt.param_groups[0]['lr']
@@ -124,15 +160,16 @@ class LinearIGN(nn.Module):
                     avg_sparse = running_sparse / counter
                     avg_tight = running_tight / counter
                     avg_denoise = running_denoise / counter
+                    avg_feat = running_feat / counter
                     # Diagnostics on A's learned diagonal
                     A_active = self.A.diag.sum().item()        # number of dims with binary value 1
                     A_total = self.A.diag.numel()
                     A_probs_mean = self.A.probs.mean().item()  # soft fraction (sigmoid before rounding)
                     print(f"[Train] Epoch [{epoch+1}/{n_epochs}] Batch [{batch_idx+1}/{num_batches}] "
-                          f"LR: {current_lr:.6f} | Loss: {avg_loss:.4f} | Rec: {avg_rec:.4f} | Sparse: {avg_sparse:.4f} | tight: {avg_tight:.4f} | denoise: {avg_denoise:.4f} | A_active: {A_active:.0f}/{A_total} | A_probs_mean: {A_probs_mean:.3f}")
+                          f"LR: {current_lr:.6f} | Loss: {avg_loss:.4f} | Rec: {avg_rec:.4f} | Sparse: {avg_sparse:.4f} | tight: {avg_tight:.4f} | denoise: {avg_denoise:.4f} | feat: {avg_feat:.4f} | A_active: {A_active:.0f}/{A_total} | A_probs_mean: {A_probs_mean:.3f}")
                     metrics = {
                     'step': global_counter, 'epoch': epoch+1, 'lr': current_lr,
-                    'loss': avg_loss, 'rec': avg_rec, 'sparse': avg_sparse, 'tight': avg_tight, 'denoise': avg_denoise,
+                    'loss': avg_loss, 'rec': avg_rec, 'sparse': avg_sparse, 'tight': avg_tight, 'denoise': avg_denoise, 'feat': avg_feat,
                     'A_active': A_active, 'A_probs_mean': A_probs_mean
                     }
                     self.log_local_metrics(metrics)
@@ -144,11 +181,12 @@ class LinearIGN(nn.Module):
                             'loss_sparse': avg_sparse,
                             'loss tight': avg_tight,
                             'loss_denoise': avg_denoise,
+                            'loss_feat': avg_feat,
                             'A_active': A_active,
                             'A_probs_mean': A_probs_mean
                         }, step=global_counter)
                     counter = 0
-                    running_loss, running_rec, running_sparse, running_tight, running_denoise = 0.0, 0.0, 0.0, 0.0, 0.0
+                    running_loss, running_rec, running_sparse, running_tight, running_denoise, running_feat = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
             
             if (epoch + 1) % self.conf.val_freq == 0:
                 self.valid(epoch)
