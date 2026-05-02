@@ -116,11 +116,16 @@ class LinearIGN(nn.Module):
                     avg_sparse = running_sparse / counter
                     avg_tight = running_tight / counter
                     avg_denoise = running_denoise / counter
+                    # Diagnostics on A's learned diagonal
+                    A_active = self.A.diag.sum().item()        # number of dims with binary value 1
+                    A_total = self.A.diag.numel()
+                    A_probs_mean = self.A.probs.mean().item()  # soft fraction (sigmoid before rounding)
                     print(f"[Train] Epoch [{epoch+1}/{n_epochs}] Batch [{batch_idx+1}/{num_batches}] "
-                          f"LR: {current_lr:.6f} | Loss: {avg_loss:.4f} | Rec: {avg_rec:.4f} | Sparse: {avg_sparse:.4f} | tight: {avg_tight:.4f} | denoise: {avg_denoise:.4f}")
+                          f"LR: {current_lr:.6f} | Loss: {avg_loss:.4f} | Rec: {avg_rec:.4f} | Sparse: {avg_sparse:.4f} | tight: {avg_tight:.4f} | denoise: {avg_denoise:.4f} | A_active: {A_active:.0f}/{A_total} | A_probs_mean: {A_probs_mean:.3f}")
                     metrics = {
                     'step': global_counter, 'epoch': epoch+1, 'lr': current_lr,
-                    'loss': avg_loss, 'rec': avg_rec, 'sparse': avg_sparse, 'tight': avg_tight, 'denoise': avg_denoise
+                    'loss': avg_loss, 'rec': avg_rec, 'sparse': avg_sparse, 'tight': avg_tight, 'denoise': avg_denoise,
+                    'A_active': A_active, 'A_probs_mean': A_probs_mean
                     }
                     self.log_local_metrics(metrics)
 
@@ -130,7 +135,9 @@ class LinearIGN(nn.Module):
                             'loss_rec': avg_rec,
                             'loss_sparse': avg_sparse,
                             'loss tight': avg_tight,
-                            'loss_denoise': avg_denoise
+                            'loss_denoise': avg_denoise,
+                            'A_active': A_active,
+                            'A_probs_mean': A_probs_mean
                         }, step=global_counter)
                     counter = 0
                     running_loss, running_rec, running_sparse, running_tight, running_denoise = 0.0, 0.0, 0.0, 0.0, 0.0
