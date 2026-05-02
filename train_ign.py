@@ -46,15 +46,15 @@ def main():
     parser.add_argument("--im_shape", type=int, nargs=3, default=[1, 32, 32], help="Image shape as C H W.")
 
     # Model-specific arguments
-    parser.add_argument("--n_layers", type=int, default=6, help="Number of layers in invertible network g.")
+    parser.add_argument("--n_layers", type=int, default=12, help="Number of layers in invertible network g.")
     parser.add_argument("--n_heads", type=int, default=4, help="Number of attention heads in g.")
     parser.add_argument("--p_sz", type=int, default=4, help="Patch size for invertible transformer g.")
-    
-    # Loss weights
+
+    # Loss weights — defaults to 0 disable each auxiliary loss; the code paths still run for instrumentation.
     parser.add_argument("--lambda_rec", type=float, default=1., help="Weight for the reconstruction loss.")
-    parser.add_argument("--lambda_sparse", type=float, default=0.75, help="Weight for the A sparsity loss.")
-    parser.add_argument("--lambda_tight", type=float, default=0.001, help="Weight for the A tightness loss.")
-    parser.add_argument("--lambda_denoise", type=float, default=1.0, help="Weight for the noisy-reconstruction (denoising) loss.")
+    parser.add_argument("--lambda_sparse", type=float, default=0.0, help="Weight for the A sparsity loss. 0 = disabled (loss still computed and logged).")
+    parser.add_argument("--lambda_tight", type=float, default=0.0, help="Weight for the A tightness loss. 0 = disabled (loss still computed and logged).")
+    parser.add_argument("--lambda_denoise", type=float, default=0.0, help="Weight for the noisy-reconstruction (denoising) loss. 0 = disabled (loss still computed and logged).")
     parser.add_argument("--noise_sigma", type=float, default=0.3, help="Noise std added to x for the denoising loss.")
 
     conf = parser.parse_args()
