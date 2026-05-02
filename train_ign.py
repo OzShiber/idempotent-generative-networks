@@ -63,7 +63,7 @@ def main():
     if conf.wandb:
         try:
             import wandb
-            wandb.init(config=conf, project="Linearizer_IGN")
+            wandb.init(config=conf, project="Linearizer_IGN", name=conf.exp_name)
         except ImportError:
             print("WandB not installed. Disabling WandB.")
             conf.wandb = False
