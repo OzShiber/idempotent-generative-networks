@@ -80,29 +80,33 @@ class LinearIGN(nn.Module):
         fx_noisy = self(x_noisy)
         loss_denoise = torch.nn.functional.l1_loss(fx_noisy, x)
 
-        # --- L_feat (Option 1a, latent feature matching): match g(x) and g(f(x))
-        # in addition to matching x and f(x) in pixel space.
+        # --- L_feat (Option 1a, latent feature matching, detach variant):
+        # match g(x) and g(f(x)) in g's latent space, in addition to matching
+        # x and f(x) in pixel space.
         #
         # The motivation: pixel L1 is a single global average that can't distinguish
         # "off by a smear of low-frequency error" from "off by sharp high-frequency
         # errors with the same pixel-sum" — both look like the same number. g is a
         # multi-scale invertible transform (each InvCNN layer halves spatial size
         # and packs structure into channels), so L1(g(x), g(f(x))) penalises the
-        # difference at a coarser, more structural level. The model gets gradient
-        # signal not just from "did you reproduce each pixel" but also "did you
-        # reproduce the structure g learned to encode".
+        # difference at a coarser, more structural level.
         #
-        # Note: g is being trained simultaneously, so this loss can degenerate
-        # if g learns to be near-identity (then loss_feat collapses to loss_rec)
-        # or saturated (then loss_feat shrinks regardless of fidelity). In
-        # practice the other pressures (A's binary mask, L_rec) seem to keep g
-        # non-degenerate, but watch loss_feat behaviour during training.
+        # CRITICAL: gx is detached. Gradient flows ONLY through the g(f(x)) side
+        # (and through f(x) back into f's parameters). Without the detach, g gets
+        # gradient from both sides of the loss, and the optimizer's easiest path
+        # is to saturate g's output range so that g(x) and g(f(x)) trivially match
+        # regardless of how well f reconstructs. This was observed empirically at
+        # lambda_feat=0.1 (run mnist_20260502_214746): loss_feat collapsed to ~0
+        # within 11 epochs, rec regressed 0.17→0.20 from ep26 to ep50, samples
+        # mode-collapsed to 6-shapes. Detaching gx breaks that escape — g's
+        # representation is a fixed target for this loss, so f has to actually
+        # produce reconstructions that match in latent space.
         #
-        # Cost: one extra forward through g (the call to self.g(fx) below).
+        # Cost: one extra forward through g per training step.
         # Disabled by default with lambda_feat=0.
         if self.conf.lambda_feat > 0:
             g_fx = self.g(fx)
-            loss_feat = torch.nn.functional.l1_loss(g_fx, gx)
+            loss_feat = torch.nn.functional.l1_loss(g_fx, gx.detach())
         else:
             # Skip the extra forward when disabled — keep the metric for logging
             # so its column in metrics.csv stays consistent.

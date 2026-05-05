@@ -60,11 +60,13 @@ def main():
     parser.add_argument("--lambda_denoise", type=float, default=0.0, help="Weight for the noisy-reconstruction (denoising) loss. 0 = disabled (loss still computed and logged).")
     parser.add_argument("--noise_sigma", type=float, default=0.3, help="Noise std added to x for the denoising loss.")
     parser.add_argument("--lambda_feat", type=float, default=0.0,
-                        help="Weight for the latent-space feature-matching loss L1(g(x), g(f(x))). "
-                             "0 = disabled (skips the extra g forward pass entirely; loss is logged as 0). "
+                        help="Weight for the latent-space feature-matching loss L1(g(f(x)), g(x).detach()). "
+                             "Encourages f's reconstructions to match the original at a coarser, structural "
+                             "level than per-pixel L1. The detach on g(x) prevents g from saturating to "
+                             "trivially satisfy the loss (a previously observed degenerate failure). "
+                             "0 = disabled (skips the extra g forward pass; loss logged as 0). "
                              "Try 0.1 to enable; 0.05–0.5 is the sensible range. Adds ~one g forward "
-                             "per training step (10–20%% slowdown depending on n_layers). See the comment "
-                             "block in lin_ign.py train_step for the full motivation and known degenerate cases.")
+                             "per training step (10–20%% slowdown depending on n_layers).")
 
     conf = parser.parse_args()
     print(conf)
