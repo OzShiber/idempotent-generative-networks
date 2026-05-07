@@ -22,7 +22,11 @@ class LinearIGN(nn.Module):
         
         # Invertible network 'g'
         # self.g = InvTransformerNet(conf.n_heads, conf.n_layers, conf.p_sz, self.conf.im_shape[-1], rgb=(self.conf.im_shape[0] == 3))
-        self.g = InvCNNNet(conf.n_layers, conf.im_shape[-1])
+        self.g = InvCNNNet(
+            conf.n_layers,
+            conf.im_shape[-1],
+            hidden_chans=getattr(conf, 'hidden_chans', 128),
+        )
         #self.g = InvUnetV2(num_layers=1, in_channels=1, im_sz=32, unet_creator=creat_song_unet)
         
         # Idempotent linear operator 'A'

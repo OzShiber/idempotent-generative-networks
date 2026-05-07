@@ -47,6 +47,12 @@ def main():
 
     # Model-specific arguments
     parser.add_argument("--n_layers", type=int, default=12, help="Number of layers in invertible network g.")
+    parser.add_argument("--hidden_chans", type=int, default=128,
+                        help="Width of each CNN coupling block — controls the channel pyramid: "
+                             "the block goes 2 → h/16 → h/4 → h → h*4 → h → h/4 → h/16 → 2. "
+                             "Default 128 reproduces the original (peak 512). 256 = ~2x wider, ~4x params per block. "
+                             "Must be divisible by 16. Doubling triggers a noticeable GPU-memory increase; "
+                             "expect to drop --batch_size from 128 to ~64 at 256 width.")
     parser.add_argument("--n_heads", type=int, default=4, help="Number of attention heads in g.")
     parser.add_argument("--p_sz", type=int, default=4, help="Patch size for invertible transformer g.")
     parser.add_argument("--binarizer", type=str, choices=['rotation', 'ste', 'gumbel'], default='rotation',

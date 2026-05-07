@@ -258,9 +258,9 @@ class AttentionSubBlock(nn.Module):
 
 
 class InvCNNNet(nn.Module):
-    def __init__(self, num_layers, im_sz):
+    def __init__(self, num_layers, im_sz, hidden_chans=128):
         super().__init__()
-        self.blocks = nn.ModuleList([InvCNNBlock(im_sz) for _ in range(num_layers)])
+        self.blocks = nn.ModuleList([InvCNNBlock(im_sz, hidden_chans=hidden_chans) for _ in range(num_layers)])
         self.splits = nn.ModuleList([SpatialSplit2x2Rand() for _ in range(num_layers)])
         self.norms = nn.ModuleList([ActNorm2d(1) for _ in range(num_layers)])
 
@@ -285,20 +285,31 @@ class InvCNNNet(nn.Module):
         return Y
 
 
-#CNN V1
+#CNN V1 — parameterized on hidden_chans (the peak/3rd-down channel count).
+# At hidden_chans=128 the pyramid is 2→8→32→128→512→128→32→8→2, exactly
+# reproducing the previous hardcoded V1. Increase to 256 to roughly double
+# width across the block (≈4× parameters at the peak — width scales params
+# quadratically since both fan-in and fan-out grow). Reduce to 64 to halve.
+# hidden_chans must be divisible by 16 since the periphery layers use
+# hidden_chans // 16 channels.
 class CNNBlock(nn.Module):
-    def __init__(self, hidden_chans, in_chans=2, k_sz=2, bias=True):
+    def __init__(self, hidden_chans=128, in_chans=2, k_sz=2, bias=True):
         super().__init__()
-        self.layer_1 = (nn.Conv2d(2, 8, k_sz, 2, 0, bias=bias))
-        self.layer_2 = (nn.Conv2d(8, 32, k_sz, 2, 0, bias=bias))
-        self.bn_1 = (nn.BatchNorm2d(32))
-        self.layer_3 = (nn.Conv2d(32, 128, k_sz, 2, 0, bias=bias))
-        self.layer_4 = (nn.Conv2d(128,512, k_sz, 2, 0, bias=bias))
-        self.layer_5 = (nn.ConvTranspose2d(512, 128, k_sz, 2, 0))
-        self.layer_6 = (nn.ConvTranspose2d(128, 32, k_sz, 2, 0))
-        self.bn_2 = (nn.BatchNorm2d(32))
-        self.layer_7 = (nn.ConvTranspose2d(32, 8, k_sz, 2, 0))
-        self.layer_8 = (nn.ConvTranspose2d(8, 2, k_sz, 2, 0))
+        assert hidden_chans % 16 == 0, f"hidden_chans must be divisible by 16, got {hidden_chans}"
+        h1 = hidden_chans // 16  # 8 at default
+        h2 = hidden_chans // 4   # 32 at default
+        h3 = hidden_chans        # 128 at default
+        h4 = hidden_chans * 4    # 512 at default
+        self.layer_1 = (nn.Conv2d(in_chans, h1, k_sz, 2, 0, bias=bias))
+        self.layer_2 = (nn.Conv2d(h1, h2, k_sz, 2, 0, bias=bias))
+        self.bn_1 = (nn.BatchNorm2d(h2))
+        self.layer_3 = (nn.Conv2d(h2, h3, k_sz, 2, 0, bias=bias))
+        self.layer_4 = (nn.Conv2d(h3, h4, k_sz, 2, 0, bias=bias))
+        self.layer_5 = (nn.ConvTranspose2d(h4, h3, k_sz, 2, 0))
+        self.layer_6 = (nn.ConvTranspose2d(h3, h2, k_sz, 2, 0))
+        self.bn_2 = (nn.BatchNorm2d(h2))
+        self.layer_7 = (nn.ConvTranspose2d(h2, h1, k_sz, 2, 0))
+        self.layer_8 = (nn.ConvTranspose2d(h1, in_chans, k_sz, 2, 0))
 
     def forward(self, x):
         x1 = self.layer_1(x)
@@ -375,10 +386,10 @@ class ActNorm2d(nn.Module):
 
 
 class InvCNNBlock(nn.Module):
-    def __init__(self, im_sz):
+    def __init__(self, im_sz, hidden_chans=128):
         super().__init__()
-        self.F = CNNBlock(hidden_chans=128)
-        self.G = CNNBlock(hidden_chans=128)
+        self.F = CNNBlock(hidden_chans=hidden_chans)
+        self.G = CNNBlock(hidden_chans=hidden_chans)
 
     def forward(self, X_1, X_2):
         Y_1 = (X_1 + self.F(X_2))
