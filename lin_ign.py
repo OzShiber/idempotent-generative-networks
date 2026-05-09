@@ -129,11 +129,41 @@ class LinearIGN(nn.Module):
             # so its column in metrics.csv stays consistent.
             loss_feat = torch.zeros((), device=x.device)
 
+        # --- L_classifier (pretrained classifier-features perceptual loss):
+        # match the penultimate-layer activations of a frozen MNIST classifier
+        # for x and f(x). The classifier is the one already trained for
+        # eval metrics (`python eval_metrics.py train ...`). Frozen + pretrained,
+        # so unlike L_feat (which uses the trainable g), there's no degenerate
+        # "saturate the feature extractor" escape — the target is fixed and
+        # semantically meaningful.
+        #
+        # Why this addresses blur where L_rec doesn't: L1 in pixel space is
+        # mean-seeking — when the model is uncertain about a pixel, the optimal
+        # L1 prediction is the median of plausible values, which averaged over
+        # a dataset = blurry. The classifier's intermediate features represent
+        # *digit identity* rather than per-pixel intensity. A smudged digit has
+        # features unlike any real-digit cluster; a sharp-but-slightly-shifted
+        # digit has features close to the right cluster. So the classifier loss
+        # rewards commitment to a specific identity, fighting the blur.
+        #
+        # Cost: one extra forward through the (small, ~100K param) classifier
+        # per training step. Frozen, so its parameters don't update; only fx
+        # carries gradient back to f.
+        # Disabled by default with lambda_classifier=0; also a no-op if the
+        # eval_classifier hasn't been loaded (no --eval_classifier_path).
+        if self.conf.lambda_classifier > 0 and self.eval_classifier is not None:
+            real_feats = self.eval_classifier(x, return_features=True)[1].detach()
+            fake_feats = self.eval_classifier(fx, return_features=True)[1]
+            loss_classifier = torch.nn.functional.l1_loss(fake_feats, real_feats)
+        else:
+            loss_classifier = torch.zeros((), device=x.device)
+
         total_loss = (self.conf.lambda_rec * loss_rec +
                       self.conf.lambda_sparse * loss_sparse +
                       self.conf.lambda_tight * loss_tight +
                       self.conf.lambda_denoise * loss_denoise +
-                      self.conf.lambda_feat * loss_feat)
+                      self.conf.lambda_feat * loss_feat +
+                      self.conf.lambda_classifier * loss_classifier)
 
         self.opt.zero_grad()
         total_loss.backward()
@@ -142,19 +172,28 @@ class LinearIGN(nn.Module):
 
 
         return (total_loss.item(), loss_rec.item(), loss_sparse.item(),
-                loss_tight.item(), loss_denoise.item(), loss_feat.item())
+                loss_tight.item(), loss_denoise.item(), loss_feat.item(),
+                loss_classifier.item())
 
     def train_model(self, train_loader, n_epochs):
         self.opt = optim.Adam(self.parameters(), lr=self.conf.lr, weight_decay=self.conf.weight_decay)
         self.sched = optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max=n_epochs)
-        
+
         device = self.device()
         global_counter = 0
-        
+
+        # If lambda_classifier is enabled, ensure the classifier is loaded
+        # before training starts (normally lazy-loaded in valid()).
+        if getattr(self.conf, 'lambda_classifier', 0.0) > 0:
+            self._maybe_load_eval()
+            if self.eval_classifier is None:
+                print("[WARN] --lambda_classifier > 0 but no classifier loaded "
+                      "(check --eval_classifier_path). Classifier loss will be 0.")
+
         print("--- Starting Training for LinearIGN ---")
         for epoch in range(n_epochs):
-                       
-            running_loss, running_rec, running_sparse, running_tight, running_denoise, running_feat = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+            running_loss, running_rec, running_sparse, running_tight, running_denoise, running_feat, running_clf = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
             counter = 0
             num_batches = len(train_loader)
 
@@ -162,7 +201,7 @@ class LinearIGN(nn.Module):
                 x = x.to(device)
                 z = torch.randn_like(x)
 
-                loss, loss_rec, loss_sparse, loss_tight, loss_denoise, loss_feat = self.train_step(x, z)
+                loss, loss_rec, loss_sparse, loss_tight, loss_denoise, loss_feat, loss_classifier = self.train_step(x, z)
 
                 B = x.shape[0]
                 counter += B
@@ -173,6 +212,7 @@ class LinearIGN(nn.Module):
                 running_tight += loss_tight * B
                 running_denoise += loss_denoise * B
                 running_feat += loss_feat * B
+                running_clf += loss_classifier * B
 
                 if (global_counter) % self.conf.log_freq == 0:
                     current_lr = self.opt.param_groups[0]['lr']
@@ -182,15 +222,17 @@ class LinearIGN(nn.Module):
                     avg_tight = running_tight / counter
                     avg_denoise = running_denoise / counter
                     avg_feat = running_feat / counter
+                    avg_clf = running_clf / counter
                     # Diagnostics on A's learned diagonal
                     A_active = self.A.diag.sum().item()        # number of dims with binary value 1
                     A_total = self.A.diag.numel()
                     A_probs_mean = self.A.probs.mean().item()  # soft fraction (sigmoid before rounding)
                     print(f"[Train] Epoch [{epoch+1}/{n_epochs}] Batch [{batch_idx+1}/{num_batches}] "
-                          f"LR: {current_lr:.6f} | Loss: {avg_loss:.4f} | Rec: {avg_rec:.4f} | Sparse: {avg_sparse:.4f} | tight: {avg_tight:.4f} | denoise: {avg_denoise:.4f} | feat: {avg_feat:.4f} | A_active: {A_active:.0f}/{A_total} | A_probs_mean: {A_probs_mean:.3f}")
+                          f"LR: {current_lr:.6f} | Loss: {avg_loss:.4f} | Rec: {avg_rec:.4f} | Sparse: {avg_sparse:.4f} | tight: {avg_tight:.4f} | denoise: {avg_denoise:.4f} | feat: {avg_feat:.4f} | clf: {avg_clf:.4f} | A_active: {A_active:.0f}/{A_total} | A_probs_mean: {A_probs_mean:.3f}")
                     metrics = {
                     'step': global_counter, 'epoch': epoch+1, 'lr': current_lr,
-                    'loss': avg_loss, 'rec': avg_rec, 'sparse': avg_sparse, 'tight': avg_tight, 'denoise': avg_denoise, 'feat': avg_feat,
+                    'loss': avg_loss, 'rec': avg_rec, 'sparse': avg_sparse, 'tight': avg_tight,
+                    'denoise': avg_denoise, 'feat': avg_feat, 'classifier': avg_clf,
                     'A_active': A_active, 'A_probs_mean': A_probs_mean
                     }
                     self.log_local_metrics(metrics)
@@ -203,11 +245,12 @@ class LinearIGN(nn.Module):
                             'loss tight': avg_tight,
                             'loss_denoise': avg_denoise,
                             'loss_feat': avg_feat,
+                            'loss_classifier': avg_clf,
                             'A_active': A_active,
                             'A_probs_mean': A_probs_mean
                         }, step=global_counter)
                     counter = 0
-                    running_loss, running_rec, running_sparse, running_tight, running_denoise, running_feat = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+                    running_loss, running_rec, running_sparse, running_tight, running_denoise, running_feat, running_clf = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
             
             if (epoch + 1) % self.conf.val_freq == 0:
                 self.valid(epoch)

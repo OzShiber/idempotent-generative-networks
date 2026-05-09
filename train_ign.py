@@ -73,6 +73,15 @@ def main():
                              "0 = disabled (skips the extra g forward pass; loss logged as 0). "
                              "Try 0.1 to enable; 0.05–0.5 is the sensible range. Adds ~one g forward "
                              "per training step (10–20%% slowdown depending on n_layers).")
+    parser.add_argument("--lambda_classifier", type=float, default=0.0,
+                        help="Weight for the pretrained-classifier perceptual loss "
+                             "L1(D(f(x))_features, D(x)_features.detach()). Uses the FROZEN MNIST classifier "
+                             "loaded via --eval_classifier_path as a feature extractor. Standard perceptual "
+                             "loss (Johnson 2016) — pushes f's outputs to match real samples in a "
+                             "semantically meaningful feature space, addressing the structural blur from L1. "
+                             "Requires --eval_classifier_path to be set and the classifier file to exist. "
+                             "0 = disabled. Try 0.1 to enable; 0.05–0.5 is the sensible range. Adds ~one "
+                             "small classifier forward per training step (~5%% slowdown).")
 
     # Quantitative evaluation — classifier-based generation metrics + OOD projection.
     # Disabled unless --eval_classifier_path is set. Requires a one-time training
