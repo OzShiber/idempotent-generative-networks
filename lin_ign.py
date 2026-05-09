@@ -313,6 +313,11 @@ class LinearIGN(nn.Module):
                 f"acc={ood_m['ood_class_acc']:.3f} "
                 f"(clean_acc={ood_m['ood_clean_acc']:.3f})"
             )
+            # Persist eval metrics to disk (one row per validation epoch),
+            # alongside the WandB log. Lets you compare runs offline by reading
+            # eval_metrics.csv from each run dir without WandB access.
+            eval_row = {'epoch': epoch + 1, **gen_m, **ood_m}
+            self.log_eval_metrics(eval_row)
             if self.conf.wandb:
                 wandb.log({**gen_m, **ood_m, "epoch": epoch})
 
@@ -343,8 +348,23 @@ class LinearIGN(nn.Module):
             print(f"Checkpoint file not found: {ckpt_file}")
     
     def log_local_metrics(self, metrics):
-    
+
         log_path = os.path.join(self.conf.exp_dir, "metrics.csv")
+        file_exists = os.path.isfile(log_path)
+        with open(log_path, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=metrics.keys())
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(metrics)
+
+    def log_eval_metrics(self, metrics):
+        """Append a row to eval_metrics.csv (separate from the per-step metrics.csv).
+
+        Eval metrics are computed once per validation epoch (different cadence
+        from the per-step training metrics), so they live in their own file.
+        Header is written on first call, rows appended thereafter.
+        """
+        log_path = os.path.join(self.conf.exp_dir, "eval_metrics.csv")
         file_exists = os.path.isfile(log_path)
         with open(log_path, 'a', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=metrics.keys())
