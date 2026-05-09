@@ -74,6 +74,20 @@ def main():
                              "Try 0.1 to enable; 0.05–0.5 is the sensible range. Adds ~one g forward "
                              "per training step (10–20%% slowdown depending on n_layers).")
 
+    # Quantitative evaluation — classifier-based generation metrics + OOD projection.
+    # Disabled unless --eval_classifier_path is set. Requires a one-time training
+    # of the classifier via `python eval_metrics.py train --out <path>`.
+    parser.add_argument("--eval_classifier_path", type=str, default="",
+                        help="Path to a trained MNIST classifier (.pth) for quantitative metrics. "
+                             "Train it once: `python eval_metrics.py train --out mnist_classifier.pth`. "
+                             "Empty (default) = no quantitative metrics, only the visualization grid. "
+                             "When set, every validation epoch logs gen_{entropy,confidence,coverage} on "
+                             "a fixed batch of f(z), and ood_{input_l1,proj_l1,improvement,class_acc} on "
+                             "a fixed batch of clean test images corrupted with --noise_sigma noise.")
+    parser.add_argument("--eval_n_samples", type=int, default=256,
+                        help="Number of samples used for quantitative eval (entropy / coverage / OOD). "
+                             "Larger = more reliable but slightly more expensive at validation time.")
+
     conf = parser.parse_args()
     print(conf)
     

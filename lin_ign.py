@@ -47,6 +47,19 @@ class LinearIGN(nn.Module):
         # Fixed noise for consistent validation visuals
         self.register_buffer("valid_z", torch.rand(conf.val_batch_size, *conf.im_shape)*2.-1.)
 
+        # Larger fixed noise batch used only for quantitative classifier
+        # metrics — 16 samples (val_batch_size) is too few for reliable
+        # entropy / coverage. Lazy: only allocated when eval_classifier_path
+        # is provided and the eval objects are loaded.
+        self._eval_n = int(getattr(conf, 'eval_n_samples', 256))
+        self.register_buffer("eval_z", torch.rand(self._eval_n, *conf.im_shape)*2.-1.)
+
+        # Eval objects (loaded on first valid() if eval_classifier_path is set).
+        self.eval_classifier = None      # MNISTClassifier or None
+        self._eval_test_x = None         # held-out clean test batch [N, C, H, W]
+        self._eval_test_y = None         # corresponding labels
+        self._eval_disabled = False      # set True if loading fails, prevents retry spam
+
     def device(self):
         return next(self.parameters()).device
 
@@ -201,6 +214,59 @@ class LinearIGN(nn.Module):
 
             self.sched.step()
     
+    def _maybe_load_eval(self):
+        """Lazy-load the MNIST classifier and a held-out test batch for OOD eval.
+
+        Called from valid(). Only loads if --eval_classifier_path was set and
+        the file exists. Skips silently (and disables itself) if not, so the
+        IGN can still train without quantitative eval if the classifier hasn't
+        been pretrained yet.
+        """
+        if self.eval_classifier is not None or self._eval_disabled:
+            return
+        path = getattr(self.conf, 'eval_classifier_path', '') or ''
+        if not path:
+            self._eval_disabled = True
+            return
+        if not os.path.exists(path):
+            print(f"[eval] WARNING: --eval_classifier_path='{path}' not found, "
+                  f"skipping classifier metrics. Train one with "
+                  f"`python eval_metrics.py train --out {path}`.")
+            self._eval_disabled = True
+            return
+
+        try:
+            from eval_metrics import MNISTClassifier
+            from data import get_data_loaders
+        except ImportError as e:
+            print(f"[eval] WARNING: eval_metrics import failed ({e}); disabling eval metrics.")
+            self._eval_disabled = True
+            return
+
+        device = self.device()
+        clf = MNISTClassifier().to(device)
+        clf.load_state_dict(torch.load(path, map_location=device))
+        clf.eval()
+        self.eval_classifier = clf
+
+        # Grab a fixed test batch for OOD eval; reused every validation epoch
+        # so OOD numbers are comparable across epochs.
+        _, test_loader = get_data_loaders(
+            self.conf.dataset,
+            self.conf.batch_size,
+            min(self._eval_n, 256),
+            self.conf.orig_im_size,
+            self.conf.target_im_size,
+        )
+        x_clean, y_true = next(iter(test_loader))
+        # Truncate to self._eval_n samples for a consistent batch size
+        x_clean = x_clean[:self._eval_n].to(device)
+        y_true = y_true[:self._eval_n].to(device)
+        self._eval_test_x = x_clean
+        self._eval_test_y = y_true
+        print(f"[eval] Loaded MNIST classifier from {path}; "
+              f"OOD test batch shape={tuple(x_clean.shape)}.")
+
     @torch.no_grad()
     def valid(self, epoch):
         self.eval()
@@ -213,13 +279,42 @@ class LinearIGN(nn.Module):
         # Create a grid of z vs f(z)
         combined_grid = denorm(gen_samples).clip(0, 1)
         grid = make_grid(combined_grid, nrow=self.conf.val_batch_size)
-        
+
         path = os.path.join(self.conf.grid_dir, f"samples_e{epoch+1}.png")
         imwrite(grid, path)
         print(f"Saved validation samples to {path}")
 
         if self.conf.wandb:
             wandb.log({"Samples (z vs f(z))": wandb.Image(path), "epoch": epoch})
+
+        # Quantitative metrics — classifier-based generation eval + OOD projection
+        # eval. Only runs if --eval_classifier_path was provided and loaded
+        # successfully. Computed every validation epoch.
+        self._maybe_load_eval()
+        if self.eval_classifier is not None:
+            from eval_metrics import classifier_metrics, ood_projection_metrics
+            # Generation metrics on a larger fixed-noise batch (256 samples by
+            # default, vs 16 for the visualization grid).
+            gen_eval_samples = self(self.eval_z)
+            gen_m = classifier_metrics(gen_eval_samples, self.eval_classifier)
+            # OOD projection metrics on held-out test batch + Gaussian noise.
+            ood_m = ood_projection_metrics(
+                self, self.eval_classifier,
+                self._eval_test_x, self._eval_test_y,
+                noise_sigma=getattr(self.conf, 'noise_sigma', 0.3),
+            )
+            print(
+                f"[eval] gen: entropy={gen_m['gen_entropy']:.3f} "
+                f"confidence={gen_m['gen_confidence']:.3f} "
+                f"coverage={gen_m['gen_coverage']}/10 | "
+                f"ood: input_l1={ood_m['ood_input_l1']:.4f} "
+                f"proj_l1={ood_m['ood_proj_l1']:.4f} "
+                f"improv={ood_m['ood_improvement']:+.4f} "
+                f"acc={ood_m['ood_class_acc']:.3f} "
+                f"(clean_acc={ood_m['ood_clean_acc']:.3f})"
+            )
+            if self.conf.wandb:
+                wandb.log({**gen_m, **ood_m, "epoch": epoch})
 
         if self.conf.save_val_ckpt:
             self.save_checkpoint(f"e{epoch+1}.pth")
