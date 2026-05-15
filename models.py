@@ -258,11 +258,21 @@ class AttentionSubBlock(nn.Module):
 
 
 class InvCNNNet(nn.Module):
-    def __init__(self, num_layers, im_sz, hidden_chans=128):
+    def __init__(self, num_layers, im_sz, hidden_chans=128, data_channels=1):
         super().__init__()
-        self.blocks = nn.ModuleList([InvCNNBlock(im_sz, hidden_chans=hidden_chans) for _ in range(num_layers)])
-        self.splits = nn.ModuleList([SpatialSplit2x2Rand() for _ in range(num_layers)])
-        self.norms = nn.ModuleList([ActNorm2d(1) for _ in range(num_layers)])
+        # After each layer: input [B, C, H, W] passes through
+        #   SpatialSplit2x2Rand → pixel_unshuffle by 2 → [B, 4C, H/2, W/2]
+        #   → chunk into 2 along channels → [B, 2C, H/2, W/2] per coupling-network half
+        # So each F/G CNNBlock sees 2*data_channels input channels.
+        # ActNorm operates on the post-pixel_shuffle output, which is back to data_channels.
+        # SpatialSplit's perm length is 4*data_channels (after pixel_unshuffle).
+        cnn_in_chans = data_channels * 2
+        self.blocks = nn.ModuleList([
+            InvCNNBlock(im_sz, hidden_chans=hidden_chans, cnn_in_chans=cnn_in_chans)
+            for _ in range(num_layers)
+        ])
+        self.splits = nn.ModuleList([SpatialSplit2x2Rand(chans=data_channels) for _ in range(num_layers)])
+        self.norms = nn.ModuleList([ActNorm2d(data_channels) for _ in range(num_layers)])
 
     def forward(self, X):
         for block, split, norm in zip(self.blocks, self.splits, self.norms):
@@ -386,10 +396,13 @@ class ActNorm2d(nn.Module):
 
 
 class InvCNNBlock(nn.Module):
-    def __init__(self, im_sz, hidden_chans=128):
+    def __init__(self, im_sz, hidden_chans=128, cnn_in_chans=2):
         super().__init__()
-        self.F = CNNBlock(hidden_chans=hidden_chans)
-        self.G = CNNBlock(hidden_chans=hidden_chans)
+        # cnn_in_chans = channels per coupling-network half after SpatialSplit2x2Rand.
+        # For MNIST (1 input channel): cnn_in_chans=2. For CIFAR (3): cnn_in_chans=6.
+        # Default 2 preserves the previous MNIST-only behaviour.
+        self.F = CNNBlock(hidden_chans=hidden_chans, in_chans=cnn_in_chans)
+        self.G = CNNBlock(hidden_chans=hidden_chans, in_chans=cnn_in_chans)
 
     def forward(self, X_1, X_2):
         Y_1 = (X_1 + self.F(X_2))

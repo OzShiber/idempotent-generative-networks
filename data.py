@@ -41,6 +41,45 @@ def mnist_normalize(x):
     return (x - mean) / std
 
 
+# Per-channel denormalize for CIFAR. x is [B, 3, H, W] in the normalized range.
+# Multiplies and shifts per-channel to recover the [0, 1] pixel range used by
+# downstream image-saving utilities (which clip to [0, 1]).
+def _per_channel_denormalize(x, mean, std):
+    import torch as _torch
+    m = _torch.tensor(mean, device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
+    s = _torch.tensor(std, device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
+    return x * s + m
+
+
+def cifar10_denormalize(x):
+    mean = (0.4914, 0.4822, 0.4465)
+    std  = (0.2023, 0.1994, 0.2010)
+    return _per_channel_denormalize(x, mean, std)
+
+
+def cifar100_denormalize(x):
+    mean = (0.5071, 0.4865, 0.4409)
+    std  = (0.2673, 0.2564, 0.2762)
+    return _per_channel_denormalize(x, mean, std)
+
+
+def get_denormalize_fn(dataset_name):
+    """Return the denormalize function appropriate for the dataset.
+
+    Used by LinearIGN.valid() to convert model output back to [0, 1] for image
+    saving. Falls back to mnist_denormalize for unknown datasets so existing
+    runs don't break — but log a warning so the mismatch is visible.
+    """
+    if dataset_name == 'mnist':
+        return mnist_denormalize
+    if dataset_name == 'cifar10':
+        return cifar10_denormalize
+    if dataset_name == 'cifar100':
+        return cifar100_denormalize
+    print(f"[data] WARNING: no denormalize for dataset='{dataset_name}', using mnist_denormalize.")
+    return mnist_denormalize
+
+
 def get_cifar10_data_loaders(train_bs, val_bs, orig_size, target_size, use_ddp=False, world_size=1, rank=0):
     # CIFAR-10 normalization values.
     mean = (0.4914, 0.4822, 0.4465)

@@ -6,7 +6,7 @@ import torch.optim as optim
 from models import InvTransformerNet, IdempotentDiagonalOperator, test_model_properties, BasicLinearizer, InvCNNNet
 from torchvision.utils import make_grid
 from utils import imwrite, find_latest_checkpoint
-from data import mnist_denormalize as denorm
+from data import get_denormalize_fn
 import wandb
 from song__unet import creat_song_unet
 import csv
@@ -22,10 +22,14 @@ class LinearIGN(nn.Module):
         
         # Invertible network 'g'
         # self.g = InvTransformerNet(conf.n_heads, conf.n_layers, conf.p_sz, self.conf.im_shape[-1], rgb=(self.conf.im_shape[0] == 3))
+        # data_channels = number of image channels (1 for MNIST, 3 for CIFAR/etc.).
+        # Threaded down to SpatialSplit, ActNorm, and CNNBlock's in_chans so the
+        # invertible pipeline handles arbitrary channel counts.
         self.g = InvCNNNet(
             conf.n_layers,
             conf.im_shape[-1],
             hidden_chans=getattr(conf, 'hidden_chans', 128),
+            data_channels=conf.im_shape[0],
         )
         #self.g = InvUnetV2(num_layers=1, in_channels=1, im_sz=32, unet_creator=creat_song_unet)
         
@@ -319,7 +323,9 @@ class LinearIGN(nn.Module):
         # Generate samples from fixed noise
         gen_samples = self(self.valid_z)
 
-        # Create a grid of z vs f(z)
+        # Create a grid of z vs f(z). The denormalize function depends on the
+        # dataset's normalization stats (MNIST vs CIFAR have different mean/std).
+        denorm = get_denormalize_fn(self.conf.dataset)
         combined_grid = denorm(gen_samples).clip(0, 1)
         grid = make_grid(combined_grid, nrow=self.conf.val_batch_size)
 
