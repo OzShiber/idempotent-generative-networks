@@ -283,7 +283,7 @@ class LinearIGN(nn.Module):
             return
 
         try:
-            from eval_metrics import MNISTClassifier
+            from eval_metrics import make_classifier
             from data import get_data_loaders
         except ImportError as e:
             print(f"[eval] WARNING: eval_metrics import failed ({e}); disabling eval metrics.")
@@ -291,7 +291,16 @@ class LinearIGN(nn.Module):
             return
 
         device = self.device()
-        clf = MNISTClassifier().to(device)
+        # Pick the classifier architecture matching this run's dataset. The .pth
+        # file at --eval_classifier_path must have been trained for the same
+        # dataset (via `python eval_metrics.py train --dataset <name>`) or the
+        # load will fail with a shape mismatch.
+        try:
+            clf = make_classifier(self.conf.dataset).to(device)
+        except ValueError as e:
+            print(f"[eval] WARNING: {e} — disabling eval metrics.")
+            self._eval_disabled = True
+            return
         clf.load_state_dict(torch.load(path, map_location=device))
         clf.eval()
         self.eval_classifier = clf

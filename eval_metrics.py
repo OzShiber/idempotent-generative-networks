@@ -67,9 +67,72 @@ class MNISTClassifier(nn.Module):
         return logits
 
 
-def train_classifier(train_loader, test_loader, device, n_epochs=5, lr=1e-3, log_every=200):
-    """Train the classifier on the IGN's data pipeline. One-time call."""
-    model = MNISTClassifier().to(device)
+class CIFAR10Classifier(nn.Module):
+    """Small CNN for CIFAR-10 classification, used as a feature extractor / oracle.
+
+    Same template as MNISTClassifier but with 3-channel input, wider conv channels,
+    and a 256-dim feature layer + dropout to handle the harder dataset. Reaches
+    ~78–82% test accuracy with ~15 epochs of training — modest by CIFAR standards
+    but adequate for use as an oracle (entropy/coverage/confidence on generated
+    samples) and as a perceptual feature extractor.
+
+    Designed for the same input shape as the IGN model: [B, 3, 32, 32].
+    """
+
+    def __init__(self, num_classes=10):
+        super().__init__()
+        # Input: [B, 3, 32, 32]
+        self.conv1 = nn.Conv2d(3, 64, 3, padding=1)
+        self.conv2 = nn.Conv2d(64, 128, 3, padding=1)
+        self.conv3 = nn.Conv2d(128, 256, 3, padding=1)
+        # After three 2x2 pools: 32 → 16 → 8 → 4
+        self.fc1 = nn.Linear(256 * 4 * 4, 256)
+        self.fc2 = nn.Linear(256, num_classes)
+        self.dropout = nn.Dropout(0.3)
+
+    def forward(self, x, return_features=False):
+        x = F.relu(self.conv1(x))
+        x = F.max_pool2d(x, 2)
+        x = F.relu(self.conv2(x))
+        x = F.max_pool2d(x, 2)
+        x = F.relu(self.conv3(x))
+        x = F.max_pool2d(x, 2)
+        x = x.flatten(1)
+        feat = F.relu(self.fc1(x))
+        # Dropout only in training; perceptual-loss / eval calls happen with
+        # the model in eval() mode so this is a no-op then.
+        logits = self.fc2(self.dropout(feat))
+        if return_features:
+            return logits, feat
+        return logits
+
+
+def make_classifier(dataset_name, num_classes=None):
+    """Return the appropriate classifier class for a dataset, uninitialized.
+
+    Both `eval_metrics.py train` (training the classifier from scratch) and
+    `LinearIGN._maybe_load_eval` (loading the trained classifier for eval +
+    perceptual loss) call this so the choice of architecture is centralized.
+    """
+    if dataset_name == 'mnist':
+        return MNISTClassifier(num_classes=num_classes or 10)
+    if dataset_name == 'cifar10':
+        return CIFAR10Classifier(num_classes=num_classes or 10)
+    if dataset_name == 'cifar100':
+        return CIFAR10Classifier(num_classes=num_classes or 100)
+    raise ValueError(
+        f"No classifier defined for dataset '{dataset_name}'. "
+        f"Supported: mnist, cifar10, cifar100."
+    )
+
+
+def train_classifier(model, train_loader, test_loader, device, n_epochs=5, lr=1e-3, log_every=200):
+    """Train the given classifier model on the IGN's data pipeline.
+
+    `model` is a freshly-constructed (and `.to(device)`'d) classifier instance
+    — typically from `make_classifier(...)`. Returns the trained model.
+    """
+    model = model.to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     for epoch in range(n_epochs):
         model.train()
@@ -193,34 +256,58 @@ def ood_projection_metrics(ign_model, classifier, x_clean, y_true, noise_sigma=0
 # -- CLI for one-time classifier training ----------------------------------
 
 def _cli_train(argv):
-    """`python eval_metrics.py train --out path.pth ...`"""
-    parser = argparse.ArgumentParser(description="Train the MNIST classifier used by IGN eval metrics.")
-    parser.add_argument("--out", type=str, default="mnist_classifier.pth",
-                        help="Where to save the trained classifier weights.")
-    parser.add_argument("--epochs", type=int, default=5, help="Training epochs.")
+    """`python eval_metrics.py train --dataset {mnist,cifar10,cifar100} --out path.pth ...`
+
+    Trains the appropriate classifier for the dataset (MNISTClassifier for mnist,
+    CIFAR10Classifier for cifar10/cifar100). Saves the state_dict to --out for
+    later loading by LinearIGN via --eval_classifier_path.
+    """
+    parser = argparse.ArgumentParser(
+        description="Train the classifier used by IGN eval metrics + perceptual loss."
+    )
+    parser.add_argument("--out", type=str, default=None,
+                        help="Where to save the trained classifier weights. "
+                             "Default: '<dataset>_classifier.pth' in the current dir.")
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="Training epochs. Default depends on dataset: "
+                             "5 for MNIST, 15 for CIFAR (harder).")
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--dataset", type=str, default="mnist")
-    parser.add_argument("--orig_im_size", type=int, default=28)
+    parser.add_argument("--dataset", type=str, default="mnist",
+                        choices=["mnist", "cifar10", "cifar100"])
+    parser.add_argument("--orig_im_size", type=int, default=None,
+                        help="Default depends on dataset: 28 for MNIST, 32 for CIFAR.")
     parser.add_argument("--target_im_size", type=int, default=32,
                         help="Must match the size used in the IGN training pipeline.")
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
     args = parser.parse_args(argv)
 
+    # Per-dataset sensible defaults — applied here rather than as argparse defaults
+    # so we can vary based on --dataset selection.
+    if args.out is None:
+        args.out = f"{args.dataset}_classifier.pth"
+    if args.epochs is None:
+        args.epochs = 5 if args.dataset == "mnist" else 15
+    if args.orig_im_size is None:
+        args.orig_im_size = 28 if args.dataset == "mnist" else 32
+
     # Lazy import to avoid pulling torchvision at module import time
     from data import get_data_loaders
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    print(f"Training MNIST classifier on {device}, {args.epochs} epochs, batch {args.batch_size}")
+    model = make_classifier(args.dataset)
+    print(f"Training {type(model).__name__} for {args.dataset} on {device}, "
+          f"{args.epochs} epochs, batch {args.batch_size}")
 
     train_loader, test_loader = get_data_loaders(
         args.dataset, args.batch_size, args.batch_size,
         args.orig_im_size, args.target_im_size,
     )
 
-    model = train_classifier(train_loader, test_loader, device, n_epochs=args.epochs, lr=args.lr)
+    model = train_classifier(model, train_loader, test_loader, device,
+                              n_epochs=args.epochs, lr=args.lr)
     torch.save(model.state_dict(), args.out)
-    print(f"Saved classifier weights to '{args.out}'")
+    print(f"Saved {args.dataset} classifier weights to '{args.out}'")
 
 
 if __name__ == "__main__":
