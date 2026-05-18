@@ -303,7 +303,13 @@ class LinearIGN(nn.Module):
             return
         clf.load_state_dict(torch.load(path, map_location=device))
         clf.eval()
-        self.eval_classifier = clf
+        # Important: assign via object.__setattr__ to bypass nn.Module's
+        # automatic submodule registration. The classifier is a logically
+        # separate frozen oracle — we don't want its weights ending up in
+        # self.state_dict() (which would bloat IGN checkpoints and break
+        # loading in contexts where the classifier isn't present).
+        # We also keep self.eval_classifier accessible for read everywhere.
+        object.__setattr__(self, 'eval_classifier', clf)
 
         # Grab a fixed test batch for OOD eval; reused every validation epoch
         # so OOD numbers are comparable across epochs.
@@ -400,7 +406,28 @@ class LinearIGN(nn.Module):
         try:
             print(f'Will now load ckpt from file {ckpt_file}')
             ckpt = torch.load(ckpt_file, map_location=self.device())
-            self.load_state_dict(ckpt)
+            # Drop eval_classifier.* keys before loading. Older checkpoints from
+            # runs that had --eval_classifier_path set accidentally captured the
+            # classifier as a submodule (nn.Module auto-registers child modules
+            # on assignment), bloating the checkpoint and breaking strict loads
+            # in test mode or runs with a different classifier path. The classifier
+            # itself is loaded from --eval_classifier_path on demand, not from
+            # the IGN checkpoint.
+            classifier_keys = [k for k in ckpt if k.startswith('eval_classifier.')]
+            if classifier_keys:
+                print(f"  (dropping {len(classifier_keys)} stale eval_classifier.* keys)")
+                ckpt = {k: v for k, v in ckpt.items() if not k.startswith('eval_classifier.')}
+            # strict=False tolerates other minor mismatches (e.g. older checkpoints
+            # missing newer buffers). Any real mismatches still get reported below.
+            incompat = self.load_state_dict(ckpt, strict=False)
+            if incompat.missing_keys or incompat.unexpected_keys:
+                print(f"[load] partial load: "
+                      f"{len(incompat.missing_keys)} missing, "
+                      f"{len(incompat.unexpected_keys)} unexpected")
+                if incompat.missing_keys:
+                    print(f"[load]   missing (first 5):    {incompat.missing_keys[:5]}")
+                if incompat.unexpected_keys:
+                    print(f"[load]   unexpected (first 5): {incompat.unexpected_keys[:5]}")
             print(f"Loaded checkpoint from {ckpt_file}")
         except FileNotFoundError:
             print(f"Checkpoint file not found: {ckpt_file}")
