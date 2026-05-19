@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from models import InvTransformerNet, IdempotentDiagonalOperator, test_model_properties, BasicLinearizer, InvCNNNet
+from models import InvTransformerNet, IdempotentDiagonalOperator, IdempotentProjectionOperator, test_model_properties, BasicLinearizer, InvCNNNet
 from torchvision.utils import make_grid
 from utils import imwrite, find_latest_checkpoint
 from data import get_denormalize_fn
@@ -33,13 +33,30 @@ class LinearIGN(nn.Module):
         )
         #self.g = InvUnetV2(num_layers=1, in_channels=1, im_sz=32, unet_creator=creat_song_unet)
         
-        # Idempotent linear operator 'A'
+        # Idempotent linear operator 'A'. Two variants:
+        #   - 'diagonal'   : A = diag(b), b ∈ {0,1}^D (current default — coordinate-aligned projection)
+        #   - 'projection' : A = Q L Q^T, Q learned orthogonal via Householder reflections
+        #                    (generalises the diagonal case; lets the model rotate the
+        #                    projection subspace away from coordinate axes)
+        # Both variants are structurally idempotent (A² = A). Defaults preserve existing behaviour.
         input_dim = self.conf.im_shape[0] * self.conf.im_shape[1] * self.conf.im_shape[2]
-        self.A = IdempotentDiagonalOperator(
-            input_dim,
+        operator_type = getattr(self.conf, 'a_operator', 'diagonal')
+        binarizer_kwargs = dict(
             binarizer=getattr(self.conf, 'binarizer', 'rotation'),
             gumbel_tau=getattr(self.conf, 'gumbel_tau', 0.5),
         )
+        if operator_type == 'diagonal':
+            self.A = IdempotentDiagonalOperator(input_dim, **binarizer_kwargs)
+        elif operator_type == 'projection':
+            self.A = IdempotentProjectionOperator(
+                input_dim,
+                n_householders=getattr(self.conf, 'n_householders', 64),
+                **binarizer_kwargs,
+            )
+        else:
+            raise ValueError(
+                f"Unknown a_operator: {operator_type!r} (expected 'diagonal' or 'projection')"
+            )
         
         # The complete Linearizer model f(x)
         self.model = BasicLinearizer(self.g, self.A)

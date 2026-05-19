@@ -764,6 +764,152 @@ class IdempotentDiagonalOperator(nn.Module):
         return y_flat.view(original_shape)
 
 
+class HouseholderRotation(nn.Module):
+    """Parametrizes an orthogonal matrix Q ∈ SO(D) as a product of K Householder
+    reflections of D-dimensional vectors.
+
+    Q = H_{v_1} · H_{v_2} · ... · H_{v_K}
+    where H_v = I - 2 v v^T / (v^T v) reflects across the hyperplane perpendicular
+    to v. Each H_v is symmetric, orthogonal, and self-inverse. Products of
+    Householders are exactly orthogonal regardless of the v values — no penalty
+    or projection step required to maintain orthogonality.
+
+    Cost per application: O(K · D) — K sequential rank-1 updates on the input.
+    Storage:               K · D parameters (the K reflection vectors).
+
+    For K = D, this parametrization spans the full orthogonal group SO(D)
+    (Householder QR theorem). For K < D it spans a restricted but typically
+    expressive subset — sufficient when Q only needs to align a few principal
+    directions.
+
+    Initialisation: vectors drawn from N(0, 1), which gives a random orthogonal
+    Q at init. To start near identity, use a smaller scale (not done here —
+    random init avoids trapping the optimizer near Q = I).
+    """
+
+    def __init__(self, D, K, eps=1e-8):
+        super().__init__()
+        self.D = D
+        self.K = K
+        self.eps = eps
+        # K reflection vectors, each of dim D. Treated as plain learnable params.
+        self.v = nn.Parameter(torch.randn(K, D))
+
+    def _apply_sequence(self, x, order):
+        """Apply Householder reflections to x in the given order.
+
+        Each reflection: H_v x = x - 2 (v · x / v · v) v
+        Implemented as one batched dot product + one scaled subtraction,
+        avoiding ever forming the D×D Householder matrix.
+        """
+        for k in order:
+            v_k = self.v[k]                                  # (D,)
+            dot = x @ v_k                                    # (B,)
+            denom = (v_k @ v_k).clamp(min=self.eps)          # scalar; eps guards div-by-zero
+            x = x - (2.0 * dot / denom).unsqueeze(-1) * v_k  # (B, D)
+        return x
+
+    def forward(self, x):
+        """Apply Q x. Input: (B, D), Output: (B, D)."""
+        return self._apply_sequence(x, range(self.K))
+
+    def inverse(self, x):
+        """Apply Q^T x.
+
+        Since Q = H_1 · H_2 · ... · H_K and each H_i is symmetric + self-inverse,
+        Q^T = H_K^T · ... · H_1^T = H_K · ... · H_1. So we apply the same
+        reflections in reverse order.
+        """
+        return self._apply_sequence(x, reversed(range(self.K)))
+
+
+class IdempotentProjectionOperator(nn.Module):
+    """A = Q L Q^T where Q is a learned orthogonal (via HouseholderRotation)
+    and L = diag(b) is the same binary diagonal as IdempotentDiagonalOperator.
+
+    Generalizes IdempotentDiagonalOperator: that operator is the special case
+    Q = I (projection onto a coordinate-aligned K-dim subspace). With a learned
+    Q, the projection direction is no longer constrained to coordinate axes —
+    the model can rotate to align the K active dimensions with arbitrary
+    subspaces of the input.
+
+    Idempotence is structural:
+      A² = Q L Q^T · Q L Q^T = Q L (Q^T Q) L Q^T = Q L · I · L Q^T = Q L² Q^T = Q L Q^T = A
+    using L² = L (since L is binary) and Q^T Q = I (orthogonality of Q).
+
+    Forward computation:
+      1. Rotate into Q's frame:    x_rot = Q^T x       (using Q.inverse)
+      2. Apply binary mask:         masked = x_rot * diag(b)
+      3. Rotate back to input frame: y     = Q (masked) (using Q.forward)
+
+    The binarization machinery for L (rotation trick, STE, gumbel-sigmoid) is
+    identical to IdempotentDiagonalOperator — the same gradient estimators apply
+    to L's probs regardless of Q.
+    """
+
+    def __init__(self, input_dim, n_householders=64,
+                 binarizer='rotation', gumbel_tau=0.5):
+        super().__init__()
+        self.input_dim = input_dim
+        self.binarizer = binarizer
+        self.gumbel_tau = gumbel_tau
+
+        # L parametrization — identical to IdempotentDiagonalOperator
+        self.logits = nn.Parameter(torch.randn(1, input_dim) - 2.)
+
+        # Q parametrization. n_householders=0 → Q is identity (degenerate; the
+        # operator then behaves identically to IdempotentDiagonalOperator).
+        # Kept as an option for ablation experiments.
+        self.use_rotation = (n_householders > 0)
+        if self.use_rotation:
+            self.Q = HouseholderRotation(input_dim, n_householders)
+        else:
+            self.Q = None
+
+    def forward(self, x, *args, **kwargs):
+        original_shape = x.shape
+        x_flat = x.view(x.shape[0], -1)
+
+        # Step 1: rotate into Q's frame.
+        # Convention: A x = Q L Q^T x, so we apply Q^T first.
+        if self.use_rotation:
+            x_rot = self.Q.inverse(x_flat)
+        else:
+            x_rot = x_flat
+
+        # Step 2: apply L — binarization identical to IdempotentDiagonalOperator.
+        probs = self.logits.sigmoid()
+        self.probs = probs
+
+        if self.binarizer == 'ste':
+            self.diag = probs.round().detach() + probs - probs.detach()
+        elif self.binarizer == 'rotation':
+            self.diag = RotationTrickEstimator.apply(probs)
+        elif self.binarizer == 'gumbel':
+            if self.training:
+                u = torch.rand_like(self.logits)
+                gumbel_noise = -torch.log(-torch.log(u + 1e-20) + 1e-20)
+            else:
+                gumbel_noise = 0.0
+            y_soft = torch.sigmoid((self.logits + gumbel_noise) / self.gumbel_tau)
+            y_hard = y_soft.round()
+            self.diag = y_hard.detach() - y_soft.detach() + y_soft
+        else:
+            raise ValueError(
+                f"Unknown binarizer: {self.binarizer!r} (expected 'rotation', 'ste', or 'gumbel')"
+            )
+
+        masked = x_rot * self.diag
+
+        # Step 3: rotate back to the input frame (apply Q).
+        if self.use_rotation:
+            y_flat = self.Q(masked)
+        else:
+            y_flat = masked
+
+        return y_flat.view(original_shape)
+
+
 class IdentityMap(nn.Module):
     def forward(self, x, *args, **kwargs):
         return x

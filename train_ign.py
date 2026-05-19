@@ -58,6 +58,21 @@ def main():
     parser.add_argument("--binarizer", type=str, choices=['rotation', 'ste', 'gumbel'], default='rotation',
                         help="Gradient estimator for the binary diagonal A. 'rotation' = current default (RotationTrickEstimator). 'ste' = plain straight-through. 'gumbel' = Gumbel-sigmoid + STE.")
     parser.add_argument("--gumbel_tau", type=float, default=0.5, help="Temperature for the gumbel binarizer (ignored for ste/rotation).")
+    parser.add_argument("--a_operator", type=str, default="diagonal",
+                        choices=["diagonal", "projection"],
+                        help="Form of the idempotent operator A. "
+                             "'diagonal' (default): A = diag(b), b in {0,1}^D — projection onto a coordinate-aligned K-dim subspace. "
+                             "'projection': A = Q L Q^T, where Q is a learned orthogonal "
+                             "(parametrized as a product of Householder reflections) and "
+                             "L is the same binary diagonal. Lets the model learn the orientation of "
+                             "its projection subspace, not just which axes to keep. Idempotent by "
+                             "construction either way. 'projection' adds n_householders * D parameters for Q.")
+    parser.add_argument("--n_householders", type=int, default=64,
+                        help="Number of Householder reflections parametrizing Q for "
+                             "--a_operator projection. K=D would span all of SO(D); "
+                             "K << D is sufficient if Q only needs to align a few principal "
+                             "directions. 64 is a sensible starting value; ignored when "
+                             "--a_operator diagonal.")
 
     # Loss weights — defaults to 0 disable each auxiliary loss; the code paths still run for instrumentation.
     parser.add_argument("--lambda_rec", type=float, default=1., help="Weight for the reconstruction loss.")
