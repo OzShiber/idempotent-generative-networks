@@ -279,12 +279,23 @@ class LinearIGN(nn.Module):
             self.sched.step()
     
     def _maybe_load_eval(self):
-        """Lazy-load the MNIST classifier and a held-out test batch for OOD eval.
+        """Lazy-load the eval feature extractor and a held-out test batch for OOD eval.
 
-        Called from valid(). Only loads if --eval_classifier_path was set and
-        the file exists. Skips silently (and disables itself) if not, so the
-        IGN can still train without quantitative eval if the classifier hasn't
-        been pretrained yet.
+        Called from valid(). Two paths depending on --eval_classifier_path:
+
+          - path == 'imagenet': use a frozen ImageNet-pretrained ResNet18 as a
+            generic feature extractor (for datasets without a single-label
+            classification target, e.g. CelebA). No on-disk file needed. The
+            extractor exposes has_classifier=False so the call site in valid()
+            skips the class-based metrics (gen_entropy/confidence/coverage,
+            ood_class_acc/clean_acc) and emits only FID + PSNR + SSIM + L1.
+
+          - any other non-empty path: load it as a .pth checkpoint for the
+            per-dataset classifier from make_classifier(). Produces the full
+            metric set.
+
+        Skips silently (and self-disables) if path is empty, file is missing,
+        or no classifier architecture is registered for self.conf.dataset.
         """
         if self.eval_classifier is not None or self._eval_disabled:
             return
@@ -292,33 +303,48 @@ class LinearIGN(nn.Module):
         if not path:
             self._eval_disabled = True
             return
-        if not os.path.exists(path):
-            print(f"[eval] WARNING: --eval_classifier_path='{path}' not found, "
-                  f"skipping classifier metrics. Train one with "
-                  f"`python eval_metrics.py train --out {path}`.")
-            self._eval_disabled = True
-            return
 
         try:
-            from eval_metrics import make_classifier
-            from data import get_data_loaders
+            from eval_metrics import make_classifier, ImageNetFeatureExtractor, _extract_features
+            from data import get_data_loaders, get_normalize_stats
         except ImportError as e:
             print(f"[eval] WARNING: eval_metrics import failed ({e}); disabling eval metrics.")
             self._eval_disabled = True
             return
 
         device = self.device()
-        # Pick the classifier architecture matching this run's dataset. The .pth
-        # file at --eval_classifier_path must have been trained for the same
-        # dataset (via `python eval_metrics.py train --dataset <name>`) or the
-        # load will fail with a shape mismatch.
-        try:
-            clf = make_classifier(self.conf.dataset).to(device)
-        except ValueError as e:
-            print(f"[eval] WARNING: {e} — disabling eval metrics.")
-            self._eval_disabled = True
-            return
-        clf.load_state_dict(torch.load(path, map_location=device))
+
+        if path == 'imagenet':
+            # Frozen ImageNet-pretrained ResNet18 feature extractor. No on-disk
+            # classifier needed. Used for datasets without a single-label
+            # classification target — currently CelebA. has_classifier=False
+            # gates the class-based metrics off at the valid() call site.
+            try:
+                mean, std = get_normalize_stats(self.conf.dataset)
+            except ValueError as e:
+                print(f"[eval] WARNING: {e} — disabling eval metrics.")
+                self._eval_disabled = True
+                return
+            clf = ImageNetFeatureExtractor(input_mean=mean, input_std=std).to(device)
+        else:
+            if not os.path.exists(path):
+                print(f"[eval] WARNING: --eval_classifier_path='{path}' not found, "
+                      f"skipping classifier metrics. Train one with "
+                      f"`python eval_metrics.py train --out {path}`.")
+                self._eval_disabled = True
+                return
+            # Pick the classifier architecture matching this run's dataset. The
+            # .pth file must have been trained for the same dataset (via
+            # `python eval_metrics.py train --dataset <name>`) or load will
+            # fail with a shape mismatch.
+            try:
+                clf = make_classifier(self.conf.dataset).to(device)
+            except ValueError as e:
+                print(f"[eval] WARNING: {e} — disabling eval metrics.")
+                self._eval_disabled = True
+                return
+            clf.load_state_dict(torch.load(path, map_location=device))
+
         clf.eval()
         # Important: assign via object.__setattr__ to bypass nn.Module's
         # automatic submodule registration. The classifier is a logically
@@ -346,12 +372,11 @@ class LinearIGN(nn.Module):
 
         # Pre-compute features of the real-data test batch ONCE for FID.
         # FID = distance between distributions of (real_features, fake_features);
-        # real_features is fixed (data + frozen classifier) so we cache it here
-        # and reuse every validation epoch. Saves a classifier forward pass per
+        # real_features is fixed (data + frozen extractor) so we cache it here
+        # and reuse every validation epoch. Saves an extractor forward pass per
         # validation cycle.
-        from eval_metrics import _extract_features
         self._eval_real_features = _extract_features(x_clean, clf)
-        print(f"[eval] Loaded {self.conf.dataset} classifier from {path}; "
+        print(f"[eval] Loaded {self.conf.dataset} eval extractor from '{path}'; "
               f"OOD test batch shape={tuple(x_clean.shape)}; "
               f"cached real features shape={tuple(self._eval_real_features.shape)} for FID.")
 
@@ -377,45 +402,62 @@ class LinearIGN(nn.Module):
         if self.conf.wandb:
             wandb.log({"Samples (z vs f(z))": wandb.Image(path), "epoch": epoch})
 
-        # Quantitative metrics — classifier-based generation eval + OOD projection
-        # eval. Only runs if --eval_classifier_path was provided and loaded
+        # Quantitative metrics — generation eval + OOD projection eval.
+        # Only runs if --eval_classifier_path was provided and loaded
         # successfully. Computed every validation epoch.
+        #
+        # Class-based metrics (gen_entropy/confidence/coverage, ood_class_acc,
+        # ood_clean_acc) are gated on the extractor having a true classifier
+        # head. The ImageNet feature extractor used for CelebA reports
+        # has_classifier=False, so those metrics are skipped and the resulting
+        # eval_metrics.csv has a narrower schema (FID + L1/PSNR/SSIM only).
         self._maybe_load_eval()
         if self.eval_classifier is not None:
             from eval_metrics import (
                 classifier_metrics, ood_projection_metrics,
                 _extract_features, compute_fid,
             )
+            has_clf = getattr(self.eval_classifier, 'has_classifier', True)
+
             # Generation metrics on a larger fixed-noise batch (256 samples by
             # default, vs 16 for the visualization grid).
             gen_eval_samples = self(self.eval_z)
-            gen_m = classifier_metrics(gen_eval_samples, self.eval_classifier)
+            gen_m = classifier_metrics(gen_eval_samples, self.eval_classifier) if has_clf else {}
 
             # FID: distributional similarity between f(z) and real data, in the
-            # local classifier's feature space. Lower is better. Real features
-            # are pre-cached in _maybe_load_eval (don't change across epochs).
+            # extractor's feature space. Lower is better. Real features are
+            # pre-cached in _maybe_load_eval (don't change across epochs).
             fake_features = _extract_features(gen_eval_samples, self.eval_classifier)
             gen_m['gen_fid'] = compute_fid(self._eval_real_features, fake_features)
 
             # OOD projection metrics on held-out test batch + Gaussian noise.
-            # Now also includes PSNR / SSIM of f(noisy) vs clean ground truth,
-            # plus the per-metric "improvement" (post-projection − pre-projection).
+            # PSNR / SSIM / L1 are classifier-free; class_acc/clean_acc require
+            # a real classifier and are gated by compute_class_acc=has_clf.
             ood_m = ood_projection_metrics(
                 self, self.eval_classifier,
                 self._eval_test_x, self._eval_test_y,
                 noise_sigma=getattr(self.conf, 'noise_sigma', 0.3),
+                compute_class_acc=has_clf,
             )
-            print(
-                f"[eval] gen: entropy={gen_m['gen_entropy']:.3f} "
-                f"confidence={gen_m['gen_confidence']:.3f} "
-                f"coverage={gen_m['gen_coverage']}/10 "
-                f"fid={gen_m['gen_fid']:.2f} | "
-                f"ood: improv={ood_m['ood_improvement']:+.4f} "
-                f"psnr_imp={ood_m['ood_psnr_improvement']:+.2f}dB "
-                f"ssim_imp={ood_m['ood_ssim_improvement']:+.3f} "
-                f"acc={ood_m['ood_class_acc']:.3f} "
-                f"(clean_acc={ood_m['ood_clean_acc']:.3f})"
-            )
+            if has_clf:
+                print(
+                    f"[eval] gen: entropy={gen_m['gen_entropy']:.3f} "
+                    f"confidence={gen_m['gen_confidence']:.3f} "
+                    f"coverage={gen_m['gen_coverage']}/10 "
+                    f"fid={gen_m['gen_fid']:.2f} | "
+                    f"ood: improv={ood_m['ood_improvement']:+.4f} "
+                    f"psnr_imp={ood_m['ood_psnr_improvement']:+.2f}dB "
+                    f"ssim_imp={ood_m['ood_ssim_improvement']:+.3f} "
+                    f"acc={ood_m['ood_class_acc']:.3f} "
+                    f"(clean_acc={ood_m['ood_clean_acc']:.3f})"
+                )
+            else:
+                print(
+                    f"[eval] gen: fid={gen_m['gen_fid']:.2f} | "
+                    f"ood: improv={ood_m['ood_improvement']:+.4f} "
+                    f"psnr_imp={ood_m['ood_psnr_improvement']:+.2f}dB "
+                    f"ssim_imp={ood_m['ood_ssim_improvement']:+.3f}"
+                )
             # Persist eval metrics to disk (one row per validation epoch),
             # alongside the WandB log. Lets you compare runs offline by reading
             # eval_metrics.csv from each run dir without WandB access.

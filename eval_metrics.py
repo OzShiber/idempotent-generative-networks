@@ -107,6 +107,64 @@ class CIFAR10Classifier(nn.Module):
         return logits
 
 
+class ImageNetFeatureExtractor(nn.Module):
+    """Frozen ImageNet-pretrained ResNet18 used as a generic feature extractor.
+
+    Drop-in replacement for the per-dataset classifiers when the dataset has
+    no natural single-label target — currently CelebA. Provides the
+    ``forward(x, return_features=True) -> (None, features)`` contract that
+    ``_extract_features`` and the eval pipeline expect, but doesn't produce
+    logits. The ``has_classifier = False`` flag tells the eval pipeline to
+    skip the class-based metrics (gen_entropy/confidence/coverage,
+    ood_class_acc/clean_acc) and emit only FID / PSNR / SSIM / L1.
+
+    The IGN's input is per-dataset normalized (e.g. mean=std=0.5 for CelebA).
+    ResNet18 expects ImageNet-normalized input (mean=[0.485, 0.456, 0.406],
+    std=[0.229, 0.224, 0.225]). We precompute the affine that maps from one
+    to the other so the forward pass costs a single multiply+add.
+
+    Caveats:
+      - Requires 3-channel input. Don't use with MNIST.
+      - The ResNet was trained on 224x224 ImageNet; we feed it 64x64 CelebA
+        crops. The conv stack still runs (it's fully convolutional up to
+        avgpool) but features at this resolution are less informative than
+        at native scale. Good enough for relative FID comparisons across
+        IGN runs on the same dataset; not directly comparable to standard
+        ImageNet-FID literature numbers.
+    """
+    has_classifier = False
+
+    def __init__(self, input_mean, input_std):
+        super().__init__()
+        from torchvision import models
+        resnet = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        # Strip the final fc; keep conv1 ... avgpool. Output: [B, 512, 1, 1].
+        self.backbone = nn.Sequential(*list(resnet.children())[:-1])
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+        self.backbone.eval()
+
+        imnet_mean = torch.tensor([0.485, 0.456, 0.406])
+        imnet_std = torch.tensor([0.229, 0.224, 0.225])
+        in_mean = torch.tensor(input_mean)
+        in_std = torch.tensor(input_std)
+        # ign_x = (real_x - in_mean) / in_std,   imnet_x = (real_x - imnet_mean) / imnet_std
+        # =>  imnet_x = ign_x * (in_std / imnet_std) + (in_mean - imnet_mean) / imnet_std
+        self.register_buffer('scale', (in_std / imnet_std).view(1, 3, 1, 1))
+        self.register_buffer('shift', ((in_mean - imnet_mean) / imnet_std).view(1, 3, 1, 1))
+
+    def forward(self, x, return_features=False):
+        x = x * self.scale + self.shift
+        feats = self.backbone(x).flatten(1)
+        if return_features:
+            return None, feats
+        # The classifier-API contract returns logits when return_features is
+        # False; we don't have any. Returning features is the safest fallback,
+        # but callers using this extractor should pass return_features=True
+        # and gate any logit-using code on .has_classifier.
+        return feats
+
+
 def make_classifier(dataset_name, num_classes=None):
     """Return the appropriate classifier class for a dataset, uninitialized.
 
@@ -352,29 +410,32 @@ def classifier_metrics(samples, classifier, num_classes=10):
 # -- OOD projection metrics ------------------------------------------------
 
 @torch.no_grad()
-def ood_projection_metrics(ign_model, classifier, x_clean, y_true, noise_sigma=0.3):
+def ood_projection_metrics(ign_model, classifier, x_clean, y_true,
+                            noise_sigma=0.3, compute_class_acc=True):
     """Project corrupted test images through `f`, measure projection quality.
 
     The headline claim of IGN is that `f` projects arbitrary inputs onto the
     learned data manifold. This function tests it on the cleanest version of
     that test: take real test images, add Gaussian noise of the given σ, push
     through `f`, and ask:
-      (a) does the L1 distance to the clean original go DOWN after projection?
-      (b) does the classifier still recognise the original digit class?
+      (a) does the L1/PSNR/SSIM distance to the clean original improve after projection?
+      (b) (if classifier has labels) does the classifier still recognise the original class?
 
     Args:
         ign_model: callable [B, C, H, W] → [B, C, H, W] (LinearIGN.forward).
-        classifier: trained MNISTClassifier.
+        classifier: trained classifier OR a feature extractor. Only used here
+                    if compute_class_acc=True (calls .forward to get logits).
         x_clean: clean test images, on the same device as ign_model.
-        y_true:  ground-truth labels (LongTensor).
+        y_true:  ground-truth labels (LongTensor). Ignored if compute_class_acc=False.
         noise_sigma: Gaussian std added pre-projection.
+        compute_class_acc: if False, skip the classifier-based accuracy metrics
+                    (ood_class_acc, ood_clean_acc) — for datasets where the
+                    "classifier" is really a feature-only extractor.
     Returns:
-        dict with:
-          - ood_input_l1     : L1(x_noisy, x_clean) — how corrupted was the input
-          - ood_proj_l1      : L1(f(x_noisy), x_clean) — how close is the projection
-          - ood_improvement  : input_l1 - proj_l1 (positive = projection moved closer)
-          - ood_class_acc    : classifier accuracy on f(x_noisy) vs y_true
-          - ood_clean_acc    : classifier accuracy on x_clean vs y_true (sanity check)
+        dict with always-on keys: ood_{input,proj}_l1, ood_improvement,
+        ood_{input,proj}_psnr, ood_psnr_improvement, ood_{input,proj}_ssim,
+        ood_ssim_improvement. When compute_class_acc=True, also includes
+        ood_class_acc and ood_clean_acc.
     """
     classifier.eval()
     z = torch.randn_like(x_clean)
@@ -384,12 +445,6 @@ def ood_projection_metrics(ign_model, classifier, x_clean, y_true, noise_sigma=0
 
     input_l1 = F.l1_loss(x_noisy, x_clean).item()
     proj_l1 = F.l1_loss(fx_noisy, x_clean).item()
-
-    proj_logits = classifier(fx_noisy)
-    proj_acc = (proj_logits.argmax(-1) == y_true).float().mean().item()
-
-    clean_logits = classifier(x_clean)
-    clean_acc = (clean_logits.argmax(-1) == y_true).float().mean().item()
 
     # PSNR / SSIM on the projection vs clean ground truth.
     # data_range computed once from the clean batch so both input and
@@ -402,12 +457,10 @@ def ood_projection_metrics(ign_model, classifier, x_clean, y_true, noise_sigma=0
     ssim_input = compute_ssim(x_noisy, x_clean, data_range=data_range)
     ssim_proj = compute_ssim(fx_noisy, x_clean, data_range=data_range)
 
-    return {
+    out = {
         'ood_input_l1': float(input_l1),
         'ood_proj_l1': float(proj_l1),
         'ood_improvement': float(input_l1 - proj_l1),
-        'ood_class_acc': float(proj_acc),
-        'ood_clean_acc': float(clean_acc),
         'ood_input_psnr': float(psnr_input),
         'ood_proj_psnr': float(psnr_proj),
         'ood_psnr_improvement': float(psnr_proj - psnr_input),
@@ -415,6 +468,16 @@ def ood_projection_metrics(ign_model, classifier, x_clean, y_true, noise_sigma=0
         'ood_proj_ssim': float(ssim_proj),
         'ood_ssim_improvement': float(ssim_proj - ssim_input),
     }
+
+    if compute_class_acc:
+        proj_logits = classifier(fx_noisy)
+        proj_acc = (proj_logits.argmax(-1) == y_true).float().mean().item()
+        clean_logits = classifier(x_clean)
+        clean_acc = (clean_logits.argmax(-1) == y_true).float().mean().item()
+        out['ood_class_acc'] = float(proj_acc)
+        out['ood_clean_acc'] = float(clean_acc)
+
+    return out
 
 
 # -- CLI for one-time classifier training ----------------------------------

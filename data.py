@@ -76,8 +76,31 @@ def get_denormalize_fn(dataset_name):
         return cifar10_denormalize
     if dataset_name == 'cifar100':
         return cifar100_denormalize
+    if dataset_name == 'celeba':
+        return celeba_denormalize
     print(f"[data] WARNING: no denormalize for dataset='{dataset_name}', using mnist_denormalize.")
     return mnist_denormalize
+
+
+def get_normalize_stats(dataset_name):
+    """Return the (mean, std) tuples used by the dataset's transforms.Normalize.
+
+    Centralised so other code (notably ImageNetFeatureExtractor) can recover
+    the IGN-normalized input range and convert it to whatever range a frozen
+    pretrained model expects, without having to duplicate per-dataset constants.
+    """
+    if dataset_name == 'mnist':
+        return (0.1307,), (0.3081,)
+    if dataset_name == 'cifar10':
+        return (0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)
+    if dataset_name == 'cifar100':
+        return (0.5071, 0.4865, 0.4409), (0.2673, 0.2564, 0.2762)
+    if dataset_name == 'celeba':
+        return (0.5, 0.5, 0.5), (0.5, 0.5, 0.5)
+    raise ValueError(
+        f"No normalize stats registered for dataset '{dataset_name}'. "
+        f"Add a branch to data.get_normalize_stats."
+    )
 
 
 def get_cifar10_data_loaders(train_bs, val_bs, orig_size, target_size, use_ddp=False, world_size=1, rank=0):
@@ -206,16 +229,21 @@ def get_celeba_data_loaders(train_bs, val_bs, orig_size, target_size, use_ddp=Fa
     # CelebA: using center crop and resize.
     mean = (0.5, 0.5, 0.5)
     std  = (0.5, 0.5, 0.5)
+    # Standard CelebA-64 protocol: CenterCrop(178) first (drops most background
+    # and keeps the head-centered framing the dataset is aligned for) then
+    # resize to target_size. The earlier "Resize then CenterCrop" order
+    # resized the short side to target before cropping, which produces a more
+    # zoomed-out face at target=64.
     train_transform = transforms.Compose([
+        transforms.CenterCrop(178),
         transforms.Resize(target_size),
-        transforms.CenterCrop(target_size),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize(mean, std)
     ])
     test_transform = transforms.Compose([
+        transforms.CenterCrop(178),
         transforms.Resize(target_size),
-        transforms.CenterCrop(target_size),
         transforms.ToTensor(),
         transforms.Normalize(mean, std)
     ])
