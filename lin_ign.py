@@ -343,8 +343,17 @@ class LinearIGN(nn.Module):
         y_true = y_true[:self._eval_n].to(device)
         self._eval_test_x = x_clean
         self._eval_test_y = y_true
-        print(f"[eval] Loaded MNIST classifier from {path}; "
-              f"OOD test batch shape={tuple(x_clean.shape)}.")
+
+        # Pre-compute features of the real-data test batch ONCE for FID.
+        # FID = distance between distributions of (real_features, fake_features);
+        # real_features is fixed (data + frozen classifier) so we cache it here
+        # and reuse every validation epoch. Saves a classifier forward pass per
+        # validation cycle.
+        from eval_metrics import _extract_features
+        self._eval_real_features = _extract_features(x_clean, clf)
+        print(f"[eval] Loaded {self.conf.dataset} classifier from {path}; "
+              f"OOD test batch shape={tuple(x_clean.shape)}; "
+              f"cached real features shape={tuple(self._eval_real_features.shape)} for FID.")
 
     @torch.no_grad()
     def valid(self, epoch):
@@ -373,12 +382,24 @@ class LinearIGN(nn.Module):
         # successfully. Computed every validation epoch.
         self._maybe_load_eval()
         if self.eval_classifier is not None:
-            from eval_metrics import classifier_metrics, ood_projection_metrics
+            from eval_metrics import (
+                classifier_metrics, ood_projection_metrics,
+                _extract_features, compute_fid,
+            )
             # Generation metrics on a larger fixed-noise batch (256 samples by
             # default, vs 16 for the visualization grid).
             gen_eval_samples = self(self.eval_z)
             gen_m = classifier_metrics(gen_eval_samples, self.eval_classifier)
+
+            # FID: distributional similarity between f(z) and real data, in the
+            # local classifier's feature space. Lower is better. Real features
+            # are pre-cached in _maybe_load_eval (don't change across epochs).
+            fake_features = _extract_features(gen_eval_samples, self.eval_classifier)
+            gen_m['gen_fid'] = compute_fid(self._eval_real_features, fake_features)
+
             # OOD projection metrics on held-out test batch + Gaussian noise.
+            # Now also includes PSNR / SSIM of f(noisy) vs clean ground truth,
+            # plus the per-metric "improvement" (post-projection − pre-projection).
             ood_m = ood_projection_metrics(
                 self, self.eval_classifier,
                 self._eval_test_x, self._eval_test_y,
@@ -387,10 +408,11 @@ class LinearIGN(nn.Module):
             print(
                 f"[eval] gen: entropy={gen_m['gen_entropy']:.3f} "
                 f"confidence={gen_m['gen_confidence']:.3f} "
-                f"coverage={gen_m['gen_coverage']}/10 | "
-                f"ood: input_l1={ood_m['ood_input_l1']:.4f} "
-                f"proj_l1={ood_m['ood_proj_l1']:.4f} "
-                f"improv={ood_m['ood_improvement']:+.4f} "
+                f"coverage={gen_m['gen_coverage']}/10 "
+                f"fid={gen_m['gen_fid']:.2f} | "
+                f"ood: improv={ood_m['ood_improvement']:+.4f} "
+                f"psnr_imp={ood_m['ood_psnr_improvement']:+.2f}dB "
+                f"ssim_imp={ood_m['ood_ssim_improvement']:+.3f} "
                 f"acc={ood_m['ood_class_acc']:.3f} "
                 f"(clean_acc={ood_m['ood_clean_acc']:.3f})"
             )

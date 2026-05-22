@@ -1,7 +1,9 @@
 from ast import Yield
 import os
 import argparse
+import random
 import torch
+import numpy as np
 import pickle
 from utils import create_experiment_dirs_ign, make_ign_inputs
 from lin_ign import LinearIGN
@@ -20,6 +22,12 @@ def main():
     parser.add_argument("--mode", type=str, choices=["train", "test"], default="train",
                         help="Whether to train a new model or run test-time projections.")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use, e.g., 'cuda:0' or 'cpu'.")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Random seed for Python, NumPy, and PyTorch (CPU + CUDA). "
+                             "Single point of control for run-to-run reproducibility. "
+                             "Two runs with the same --seed and identical configuration should "
+                             "produce identical trajectories (modulo nondeterministic CUDA ops). "
+                             "Use different seeds for multi-seed ablations.")
     parser.add_argument("--n_epochs", type=int, default=50000, help="Number of training epochs.")
     parser.add_argument("--batch_size", type=int, default=512, help="Training batch size.")
     parser.add_argument("--val_batch_size", type=int, default=16, help="Validation batch size (for grid).")
@@ -114,7 +122,19 @@ def main():
 
     conf = parser.parse_args()
     print(conf)
-    
+
+    # Seed all RNGs before constructing anything. Done as early as possible so
+    # model init, data shuffling, and validation-noise sampling are all
+    # deterministic given the same --seed. Two runs with identical config
+    # and identical --seed should reproduce each other modulo nondeterministic
+    # CUDA ops (matmul/conv kernels, atomic adds on GPU).
+    random.seed(conf.seed)
+    np.random.seed(conf.seed)
+    torch.manual_seed(conf.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(conf.seed)
+    print(f"[seed] all RNGs set to {conf.seed}")
+
     if conf.wandb:
         try:
             import wandb

@@ -162,6 +162,153 @@ def train_classifier(model, train_loader, test_loader, device, n_epochs=5, lr=1e
     return model
 
 
+# -- Distribution-level / image-quality metrics ----------------------------
+
+@torch.no_grad()
+def _extract_features(samples, classifier, batch_size=128):
+    """Run classifier in feature-extraction mode over a batch (or larger set).
+
+    Returns [N, D] features from the penultimate layer. Used by FID below.
+    Batched in case the input doesn't fit in memory.
+    """
+    classifier.eval()
+    feats = []
+    for i in range(0, samples.shape[0], batch_size):
+        chunk = samples[i:i + batch_size]
+        _, f = classifier(chunk, return_features=True)
+        feats.append(f)
+    return torch.cat(feats, dim=0)
+
+
+@torch.no_grad()
+def compute_fid(real_features, fake_features, eps=1e-6):
+    """Fréchet Inception Distance between two feature distributions.
+
+    Computes the Wasserstein-2 distance between Gaussians fit to the two
+    feature batches:
+        FID = ||μ_r - μ_f||² + tr(Σ_r + Σ_f - 2·(Σ_r Σ_f)^{1/2})
+
+    Lower is better. For MNIST/CIFAR with ~256 samples this is noisy but
+    informative for relative comparison across runs. The standard "stable"
+    FID uses 10K+ samples; for our internal-comparison use case 256-512 is
+    enough to detect meaningful differences.
+
+    Uses the project's local classifier as feature extractor instead of
+    the InceptionV3 normally used for natural images — this is FID computed
+    in the local feature space, not the standard ImageNet-FID.
+
+    Args:
+        real_features: [N, D] features from real images
+        fake_features: [M, D] features from generated images
+    Returns:
+        scalar FID (float)
+    """
+    real_features = real_features.float()
+    fake_features = fake_features.float()
+
+    mu_r = real_features.mean(dim=0)
+    mu_f = fake_features.mean(dim=0)
+
+    # Covariance matrices, with small ridge for numerical stability
+    D = real_features.shape[1]
+    sigma_r = torch.cov(real_features.T) + eps * torch.eye(D, device=real_features.device)
+    sigma_f = torch.cov(fake_features.T) + eps * torch.eye(D, device=real_features.device)
+
+    diff = mu_r - mu_f
+    mean_term = (diff * diff).sum()
+
+    # Matrix sqrt of (Σ_r Σ_f) via eigendecomposition. The product isn't
+    # symmetric but its eigenvalues are real and non-negative (the matrices
+    # are PSD). Clamp at 0 for numerical safety.
+    cov_prod = sigma_r @ sigma_f
+    eigenvalues = torch.linalg.eigvals(cov_prod).real
+    sqrt_trace = eigenvalues.clamp(min=0).sqrt().sum()
+
+    trace_term = torch.trace(sigma_r) + torch.trace(sigma_f) - 2 * sqrt_trace
+
+    fid = mean_term + trace_term
+    return float(fid.item())
+
+
+@torch.no_grad()
+def compute_psnr(x, y, data_range=None):
+    """Mean per-sample Peak Signal-to-Noise Ratio over a batch.
+
+    PSNR = 20 · log10(data_range / sqrt(MSE))
+    Higher is better. Reported in dB. Standard restoration-quality metric.
+
+    Args:
+        x, y: [B, C, H, W] tensors. Expected in matched range.
+        data_range: max(x ∪ y) − min(x ∪ y). If None, inferred from x.
+    Returns:
+        mean PSNR across batch (float, in dB)
+    """
+    if data_range is None:
+        data_range = float(x.max() - x.min())
+    if data_range <= 0:
+        data_range = 1.0
+    mse = ((x - y) ** 2).mean(dim=[1, 2, 3])
+    psnr = 20.0 * torch.log10(data_range / (mse.sqrt() + 1e-10))
+    return float(psnr.mean().item())
+
+
+def _gaussian_window(window_size, sigma, channels, device):
+    """1D Gaussian window expanded to a 2D channel-wise filter for SSIM."""
+    coords = torch.arange(window_size, device=device, dtype=torch.float32) - window_size // 2
+    g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    g = g / g.sum()
+    window_2d = g[:, None] * g[None, :]  # [W, W]
+    return window_2d.expand(channels, 1, window_size, window_size).contiguous()
+
+
+@torch.no_grad()
+def compute_ssim(x, y, window_size=11, sigma=1.5, data_range=None):
+    """Mean per-sample Structural Similarity over a batch.
+
+    SSIM = (2·μ_x·μ_y + c1) (2·σ_xy + c2) / ((μ_x² + μ_y² + c1) (σ_x² + σ_y² + c2))
+    where μ, σ are Gaussian-windowed local statistics. Returns mean SSIM in [-1, 1]
+    (typically [0, 1] for real images). Higher is better. Standard perceptual-quality
+    metric for restoration.
+
+    Args:
+        x, y: [B, C, H, W] tensors in matched range
+        window_size: Gaussian window size (must be odd)
+        sigma:       Gaussian std for the window
+        data_range:  max - min over data range; inferred from x if None
+    Returns:
+        mean SSIM across batch (float)
+    """
+    if data_range is None:
+        data_range = float(x.max() - x.min())
+    if data_range <= 0:
+        data_range = 1.0
+    c1 = (0.01 * data_range) ** 2
+    c2 = (0.03 * data_range) ** 2
+
+    channels = x.shape[1]
+    window = _gaussian_window(window_size, sigma, channels, x.device)
+    pad = window_size // 2
+
+    # Local means via Gaussian-weighted convolution, applied per-channel (groups=C)
+    mu_x = F.conv2d(x, window, padding=pad, groups=channels)
+    mu_y = F.conv2d(y, window, padding=pad, groups=channels)
+
+    mu_x_sq = mu_x ** 2
+    mu_y_sq = mu_y ** 2
+    mu_xy = mu_x * mu_y
+
+    sigma_x_sq = F.conv2d(x * x, window, padding=pad, groups=channels) - mu_x_sq
+    sigma_y_sq = F.conv2d(y * y, window, padding=pad, groups=channels) - mu_y_sq
+    sigma_xy = F.conv2d(x * y, window, padding=pad, groups=channels) - mu_xy
+
+    ssim_map = (
+        (2 * mu_xy + c1) * (2 * sigma_xy + c2)
+        / ((mu_x_sq + mu_y_sq + c1) * (sigma_x_sq + sigma_y_sq + c2))
+    )
+    # Average over spatial + channel dims for per-sample SSIM, then over batch.
+    return float(ssim_map.mean().item())
+
+
 # -- Generation metrics ----------------------------------------------------
 
 @torch.no_grad()
@@ -244,12 +391,29 @@ def ood_projection_metrics(ign_model, classifier, x_clean, y_true, noise_sigma=0
     clean_logits = classifier(x_clean)
     clean_acc = (clean_logits.argmax(-1) == y_true).float().mean().item()
 
+    # PSNR / SSIM on the projection vs clean ground truth.
+    # data_range computed once from the clean batch so both input and
+    # projection PSNRs use the same scale and can be directly compared.
+    data_range = float(x_clean.max() - x_clean.min())
+    if data_range <= 0:
+        data_range = 1.0
+    psnr_input = compute_psnr(x_noisy, x_clean, data_range=data_range)
+    psnr_proj = compute_psnr(fx_noisy, x_clean, data_range=data_range)
+    ssim_input = compute_ssim(x_noisy, x_clean, data_range=data_range)
+    ssim_proj = compute_ssim(fx_noisy, x_clean, data_range=data_range)
+
     return {
         'ood_input_l1': float(input_l1),
         'ood_proj_l1': float(proj_l1),
         'ood_improvement': float(input_l1 - proj_l1),
         'ood_class_acc': float(proj_acc),
         'ood_clean_acc': float(clean_acc),
+        'ood_input_psnr': float(psnr_input),
+        'ood_proj_psnr': float(psnr_proj),
+        'ood_psnr_improvement': float(psnr_proj - psnr_input),
+        'ood_input_ssim': float(ssim_input),
+        'ood_proj_ssim': float(ssim_proj),
+        'ood_ssim_improvement': float(ssim_proj - ssim_input),
     }
 
 
