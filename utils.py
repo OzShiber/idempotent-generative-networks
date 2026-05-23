@@ -70,72 +70,6 @@ def handle_devices(device):
 
 
 
-def create_experiment_dirs(results_dir, dataset, exp_name="", save_code_snippet=True):
-    date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_name = f"{dataset}_{date_str}"
-    if exp_name:
-        base_name += f"_{exp_name}"
-    exp_dir = os.path.join(results_dir, base_name)
-    ckpt_dir = os.path.join(exp_dir, "ckpts")
-    grid_dir = os.path.join(exp_dir, "generated")
-    os.makedirs(ckpt_dir, exist_ok=True)
-    os.makedirs(grid_dir, exist_ok=True)
-
-    if save_code_snippet:
-        code_dir = os.path.join(exp_dir, "code_snippet")
-        os.makedirs(code_dir, exist_ok=True)
-
-        src_paths = {
-            "train_diffusion.py": os.path.abspath(sys.argv[0]),
-            "lin_diff.py": importlib.import_module("lin_diff").__file__,
-            "models.py": importlib.import_module("models").__file__,
-            "utils.py": os.path.abspath(__file__),
-            "data.py": importlib.import_module("data").__file__,
-        }
-        copied = []
-        for name, src in src_paths.items():
-            if src and os.path.isfile(src):
-                shutil.copy2(src, os.path.join(code_dir, name))
-                copied.append(name)
-        print(f"[code_snippet] Saved {len(copied)} files to {code_dir}: {copied}")
-
-    return exp_dir, ckpt_dir, grid_dir
-
-
-def create_experiment_dirs_evo(results_dir, dataset, exp_name="", save_code_snippet=True):
-    date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_name = f"{dataset}_{date_str}"
-    if exp_name:
-        base_name += f"_{exp_name}"
-    exp_dir = os.path.join(results_dir, base_name)
-    ckpt_dir = os.path.join(exp_dir, "ckpts")
-    grid_dir = os.path.join(exp_dir, "generated")
-    os.makedirs(ckpt_dir, exist_ok=True)
-    os.makedirs(grid_dir, exist_ok=True)
-
-    if save_code_snippet:
-        code_dir = os.path.join(exp_dir, "code_snippet")
-        os.makedirs(code_dir, exist_ok=True)
-
-        src_paths = {
-            "train_evolution.py": os.path.abspath(sys.argv[0]),
-            "lin_evolution.py": importlib.import_module("lin_evolution").__file__,
-            "models.py": importlib.import_module("models").__file__,
-            "utils.py": os.path.abspath(__file__),
-            "data.py": importlib.import_module("data").__file__,
-        }
-        copied = []
-        for name, src in src_paths.items():
-            if src and os.path.isfile(src):
-                shutil.copy2(src, os.path.join(code_dir, name))
-                copied.append(name)
-        print(f"[code_snippet] Saved {len(copied)} files to {code_dir}: {copied}")
-
-    return exp_dir, ckpt_dir, grid_dir
-
-
-
-
 def create_experiment_dirs_ign(results_dir, dataset, exp_name="", save_code_snippet=True):
     date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     base_name = f"{dataset}_{date_str}"
@@ -169,41 +103,6 @@ def create_experiment_dirs_ign(results_dir, dataset, exp_name="", save_code_snip
         print(f"[code_snippet] Saved {len(copied)} files to {code_dir}: {copied}")
 
     return exp_dir, ckpt_dir, grid_dir
-
-
-
-def create_experiment_dirs_classify(results_dir, dataset, exp_name="", save_code_snippet=True):
-    date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_name = f"{dataset}_{date_str}"
-    if exp_name:
-        base_name += f"_{exp_name}"
-    exp_dir = os.path.join(results_dir, base_name)
-    ckpt_dir = os.path.join(exp_dir, "ckpts")
-    os.makedirs(ckpt_dir, exist_ok=True)
-
-    if save_code_snippet:
-        code_dir = os.path.join(exp_dir, "code_snippet")
-        os.makedirs(code_dir, exist_ok=True)
-
-        # Ensure the new scripts can be found by importlib
-        sys.path.append(os.path.dirname(os.path.abspath(sys.argv[0])))
-
-        src_paths = {
-            "train_classify.py": os.path.abspath(sys.argv[0]),
-            "lin_classify.py": importlib.import_module("lin_classify").__file__,
-            "models.py": importlib.import_module("models").__file__,
-            "utils.py": os.path.abspath(__file__),
-            "data.py": importlib.import_module("data").__file__,
-        }
-        copied = []
-        for name, src in src_paths.items():
-            if src and os.path.isfile(src):
-                shutil.copy2(src, os.path.join(code_dir, name))
-                copied.append(name)
-        print(f"[code_snippet] Saved {len(copied)} files to {code_dir}: {copied}")
-
-    return exp_dir, ckpt_dir
-
 
 
 

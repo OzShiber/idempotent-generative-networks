@@ -631,7 +631,7 @@ class MLPBlock(nn.Module):
 class InvertibleMix(nn.Module):
     def __init__(self, M):
         super().__init__()
-        scnn_L1_nobiaself.M = int(M)
+        self.M = int(M)
         self.register_buffer("perm", torch.empty(0, dtype=torch.long))
 
     def forward(self, x1, x2):
@@ -915,75 +915,3 @@ class IdentityMap(nn.Module):
         return x
     def inverse(self, x, *args, **kwargs):
         return x
-
-
-
-
-
-
-
-
-
-
-
-
-
-class GetKer(nn.Module):
-    def __init__(self, k_shape, n_layers=5, hidden_dim=64):
-        super().__init__()
-        self.k_shape, self.hidden_dim = k_shape, hidden_dim
-        self.layers = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim) for _ in range(n_layers)])
-        self.final_layer = nn.Linear(hidden_dim, math.prod(k_shape))
-
-    def forward(self, t):
-        device = next(self.parameters()).device
-        t = t * torch.ones(1, 1, device=device, 
-                           dtype=torch.float32) # [B, 1] support both tensor and scalar
-        k = positional_encoding(t, num_freqs=self.hidden_dim//2) # [B, hidden_dim]
-        for layer in self.layers:
-            k = F.gelu(layer(k))
-        k = self.final_layer(k) 
-        return mat.view(self.k_shape)
-
-
-
-
-
-
-class LinConv(nn.Module):
-    def __init__(self, k_shape=(3, 3, 5, 5), k_n_layers=5, k_hidden_dim=64):
-        super().__init__()
-        self.k_layers = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim) for _ in range(n_layers)])
-        self.k_final_layer = nn.Linear(hidden_dim, math.prod(k_shape))
-        self.k_shape, self.k_hidden_dim = k_shape, k_hidden_dim
-
-    def forward(self, x, style):
-        k = self.get_ker(style, x.device)
-        return F.conv2d(x, k, 1, padding='same')
-
-    def get_ker(self, style, device):
-        style *= torch.ones(1, 1, device=device, 
-                            dtype=torch.float32) # [B, 1] support both tensor and scalar
-        k = positional_encoding(style, num_freqs=self.k_hidden_dim//2) # [B, hidden_dim]
-        for layer in self.layers:
-            k = F.gelu(layer(k))
-        k = self.final_layer(k) 
-        return k.view(self.k_shape)
-
-    @torch.no_grad()
-    def k2bttb(self, k, H, W):
-        C_in = k.shape[1] 
-        N_in = C_in * H * W
-        I = torch.eye(N_in, device=k.device)  # [N_in, N_in]
-        basis = I.view(N_in, C_in, H, W)
-        Y = conv(basis)  # [N_in, C_out, H, W]
-        A = Y.reshape(N_in, -1).T  # [C_out*H*W, C_in*H*W]
-        return A 
-
-    @torch.no_grad()
-    def pinv(self, y, style):
-        k = self.get_ker(style, y.device)
-        A = self.k2bttb(k, y.shape[2:])
-        A_pinv = torch.linalg.pinv(A)
-        y_pinved = A @ y.view(-1)
-        return y_pinved.view_as(y)

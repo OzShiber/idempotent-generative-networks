@@ -263,29 +263,6 @@ def get_celeba_data_loaders(train_bs, val_bs, orig_size, target_size, use_ddp=Fa
 
 
 
-def get_mnist_data_loaders(train_bs, val_bs, orig_size, target_size, use_ddp=False, world_size=1, rank=0):
-    train_transform = transforms.Compose([
-        transforms.Resize(target_size),
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,))
-    ])
-    test_transform = transforms.Compose([
-        transforms.Resize(target_size),
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,))
-    ])
-    train_dataset = datasets.MNIST(root='./data', train=True, download=True, transform=train_transform)
-    val_dataset = datasets.MNIST(root='./data', train=False, download=True, transform=test_transform)
-    
-
-    train_loader = DataLoader(train_dataset, batch_size=train_bs, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=val_bs, shuffle=False, num_workers=4, pin_memory=True)
-    
-    return train_loader, val_loader
-
-
-
-
 class MovingPoints(Dataset):
     def __init__(self, root, min_dt, max_dt, fps, ordered=False):
         self.tensors = [torch.load(p) for p in sorted(glob.glob(os.path.join(root, "*.pt")))]
