@@ -105,11 +105,24 @@ class LinearIGN(nn.Module):
         # is redundant but not harmful (set lambda_sparse=0 to disable).
         loss_sparse = self.A.diag.mean()
 
-        # --- L_tight: kept for instrumentation; lambda_tight=0 by default.
-        # Empirically this loss grows during training (opposite of intent) and
-        # has been shown to harm generation quality even at small weights.
+        # --- L_tight (v2 — log-ratio of latent variance vs reference variance).
+        # Original formulation was |‖gx‖² − ‖x − g⁻¹(0)‖²| per-sample then averaged.
+        # That had two structural problems that made it unusable as a regularizer
+        # and ambiguous as a sensor:
+        #   1. Not scale-invariant. The InvCNN's ActNorm has no constraint keeping
+        #      ‖gx‖ bounded, so gx grows during training while (x − g⁻¹(0)) stays
+        #      roughly fixed. The abs-difference is dominated by gx² growth.
+        #   2. It grew during healthy training, not just under collapse — what
+        #      distinguished healthy from collapse was the *rate* of growth, not
+        #      the value itself.
+        # The log-ratio formulation below is scale-invariant, symmetric in both
+        # directions of imbalance (g amplifies vs. g compresses), and has a clear
+        # zero at variance-match. Safe to minimize as a regularizer.
         zero = self.g.inverse(torch.zeros_like(x[:1]))
-        loss_tight = (gx.pow(2).mean((1, 2, 3)) - (x - zero).pow(2).mean((1, 2, 3))).abs().mean()
+        gx_var = gx.pow(2).mean()
+        ref_var = (x - zero).pow(2).mean()
+        eps = 1e-8
+        loss_tight = ((gx_var + eps).log() - (ref_var + eps).log()).pow(2)
 
         # --- L_denoise: f(x + sigma*z) should match x. Direct projection signal
         # for f when fed non-real inputs. Empirically not strong enough on its own
