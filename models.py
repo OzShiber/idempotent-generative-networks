@@ -122,6 +122,39 @@ class SpatialSplit2x2Rand(nn.Module):
         return unshuffled.chunk(2, dim=1)
 
 
+class ChannelSplit(nn.Module):
+    """Pure channel-based split with a random per-layer permutation.
+
+    Replaces SpatialSplit2x2Rand inside InvCNNNet. The key difference:
+    no pixel_unshuffle/shuffle happens per layer — spatial structure is
+    never decomposed into independent sub-grids, so the 4-quadrant artifact
+    that appeared when generating from i.i.d. noise is eliminated.
+
+    pixel_unshuffle(2) is applied ONCE at the InvCNNNet entry/exit instead,
+    giving (B, 4C, H/2, W/2). All coupling layers then operate in this
+    fixed downsampled space via channel splits only.
+
+    forward(x)  → (x1, x2) : permute channels, chunk into two halves.
+    inverse(x1, x2) → x    : cat halves, undo permutation.
+
+    Invertibility proof (one layer):
+      forward: X_perm = X[:, perm]; X1, X2 = chunk(X_perm)
+      inverse: cat([X1_r, X2_r])[:, inv_perm]
+             = X_perm[:, inv_perm] = X[:, perm][:, inv_perm] = X  ✓
+    """
+    def __init__(self, n_chans):
+        super().__init__()
+        perm = torch.randperm(n_chans)
+        self.register_buffer('perm', perm)
+        self.register_buffer('inv_perm', torch.argsort(perm))
+
+    def forward(self, x):
+        return x[:, self.perm].chunk(2, dim=1)
+
+    def inverse(self, x1, x2):
+        return torch.cat([x1, x2], dim=1)[:, self.inv_perm]
+
+
 
 
 
@@ -260,38 +293,50 @@ class AttentionSubBlock(nn.Module):
 class InvCNNNet(nn.Module):
     def __init__(self, num_layers, im_sz, hidden_chans=128, data_channels=1):
         super().__init__()
-        # After each layer: input [B, C, H, W] passes through
-        #   SpatialSplit2x2Rand → pixel_unshuffle by 2 → [B, 4C, H/2, W/2]
-        #   → chunk into 2 along channels → [B, 2C, H/2, W/2] per coupling-network half
-        # So each F/G CNNBlock sees 2*data_channels input channels.
-        # ActNorm operates on the post-pixel_shuffle output, which is back to data_channels.
-        # SpatialSplit's perm length is 4*data_channels (after pixel_unshuffle).
-        cnn_in_chans = data_channels * 2
+        # Architecture: pixel_unshuffle(2) is applied ONCE at network entry/exit.
+        # This maps (B, C, H, W) → (B, 4C, H/2, W/2) and all coupling layers
+        # operate in this fixed downsampled space using ChannelSplit (channel-only
+        # permutations, no spatial decomposition per layer).
+        #
+        # Previously SpatialSplit2x2Rand did pixel_unshuffle EVERY layer, which
+        # decomposed the image into 4 spatially interlaced phases and processed
+        # them semi-independently. For i.i.d. noise inputs the 4 phases were
+        # uncorrelated, producing a visible 2x2 quadrant artifact in generated
+        # samples. ChannelSplit eliminates this by never re-decomposing spatial
+        # structure within the coupling stack.
+        #
+        # Coupling network shapes are identical to before:
+        #   each CNNBlock sees (B, 2*data_channels, H/2, W/2).
+        # ActNorm now operates on 4*data_channels channels (the full shuffled
+        # representation) instead of data_channels.
+        shuffled_chans = data_channels * 4   # channels in the pixel_unshuffle(2) space
+        cnn_in_chans   = shuffled_chans // 2  # = 2 * data_channels, one coupling half
+
         self.blocks = nn.ModuleList([
-            InvCNNBlock(im_sz, hidden_chans=hidden_chans, cnn_in_chans=cnn_in_chans)
+            InvCNNBlock(im_sz // 2, hidden_chans=hidden_chans, cnn_in_chans=cnn_in_chans)
             for _ in range(num_layers)
         ])
-        self.splits = nn.ModuleList([SpatialSplit2x2Rand(chans=data_channels) for _ in range(num_layers)])
-        self.norms = nn.ModuleList([ActNorm2d(data_channels) for _ in range(num_layers)])
+        self.splits = nn.ModuleList([ChannelSplit(shuffled_chans) for _ in range(num_layers)])
+        self.norms  = nn.ModuleList([ActNorm2d(shuffled_chans)    for _ in range(num_layers)])
 
     def forward(self, X):
+        X = F.pixel_unshuffle(X, 2)              # (B, 4C, H/2, W/2) — enter once
         for block, split, norm in zip(self.blocks, self.splits, self.norms):
-            X_1, X_2 = split(X)
-            X_1, X_2 = block(X_1, X_2)
-            X = torch.cat([X_1, X_2], 1)
-            X = F.pixel_shuffle(X, 2)
-            X = norm(X)
-        # X += torch.randn_like(X) * 0.01
+            X_1, X_2 = split(X)                  # permute channels + chunk
+            X_1, X_2 = block(X_1, X_2)           # additive coupling
+            X = split.inverse(X_1, X_2)          # cat + undo permutation
+            X = norm(X)                           # per-channel ActNorm
+        X = F.pixel_shuffle(X, 2)                # (B, C, H, W) — exit once
         return X
 
     def inverse(self, Y):
+        Y = F.pixel_unshuffle(Y, 2)              # (B, 4C, H/2, W/2) — enter once
         for block, split, norm in zip(reversed(self.blocks), reversed(self.splits), reversed(self.norms)):
-            Y = norm.inverse(Y)
-            Y = F.pixel_unshuffle(Y, 2)
-            Y_1, Y_2 = Y.chunk(2, dim=1)
-            Y_1, Y_2 = block.inverse(Y_1, Y_2)
-            Y = split.inverse(Y_1, Y_2)
-        # Y += torch.randn_like(Y) * 0.01
+            Y = norm.inverse(Y)                  # undo ActNorm
+            Y_1, Y_2 = split(Y)                  # same permute+chunk as forward
+            Y_1, Y_2 = block.inverse(Y_1, Y_2)  # undo coupling
+            Y = split.inverse(Y_1, Y_2)          # cat + undo permutation
+        Y = F.pixel_shuffle(Y, 2)                # (B, C, H, W) — exit once
         return Y
 
 
@@ -398,8 +443,9 @@ class ActNorm2d(nn.Module):
 class InvCNNBlock(nn.Module):
     def __init__(self, im_sz, hidden_chans=128, cnn_in_chans=2):
         super().__init__()
-        # cnn_in_chans = channels per coupling-network half after SpatialSplit2x2Rand.
-        # For MNIST (1 input channel): cnn_in_chans=2. For CIFAR (3): cnn_in_chans=6.
+        # cnn_in_chans = channels per coupling-network half (one half of the
+        # pixel_unshuffle(2) representation). For MNIST (1 input channel):
+        # cnn_in_chans=2 (= 4*1//2). For CIFAR/CelebA (3): cnn_in_chans=6 (= 4*3//2).
         # Default 2 preserves the previous MNIST-only behaviour.
         self.F = CNNBlock(hidden_chans=hidden_chans, in_chans=cnn_in_chans)
         self.G = CNNBlock(hidden_chans=hidden_chans, in_chans=cnn_in_chans)
