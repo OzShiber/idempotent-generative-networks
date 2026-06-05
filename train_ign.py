@@ -33,6 +33,13 @@ def main():
     parser.add_argument("--val_batch_size", type=int, default=16, help="Validation batch size (for grid).")
     parser.add_argument("--log_freq", type=int, default=20, help="Log frequency (in steps).")
     parser.add_argument("--save_val_ckpt", action=argparse.BooleanOptionalAction, default=True, help="Save a checkpoint after validation.")
+    parser.add_argument("--keep_last_n_ckpts", type=int, default=3,
+                        help="Keep only the N most recent per-epoch checkpoints (e{N}.pth); "
+                             "older ones are deleted after each save to bound disk usage. "
+                             "0 (or negative) = keep every checkpoint (old behaviour). "
+                             "Default 3. final_model.pth is never pruned. At ~370 MB/ckpt for "
+                             "a 30L w256 model, the old keep-all behaviour cost ~18 GB per 50-epoch "
+                             "run and repeatedly filled the shared disk.")
     parser.add_argument("--val_freq", type=int, default=1, help="Validation frequency (in epochs).")
     parser.add_argument("--ckpt", type=str, default='/home/assaf.sh/projects/Linearizer/results/ZZZ_mnist_20250921_151747_ign_mnist_BASE/ckpts/e903.pth', help="Checkpoint to load: 'latest' or a filename.")
     # parser.add_argument("--ckpt", type=str, default='/home/assaf.sh/projects/Linearizer/results/mnist_20250922_013040_ign_mnist/ckpts/e4929.pth', help="Checkpoint to load: 'latest' or a filename.")

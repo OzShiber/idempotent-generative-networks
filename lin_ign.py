@@ -490,7 +490,45 @@ class LinearIGN(nn.Module):
         ckpt_path = os.path.join(self.conf.ckpt_dir, filename)
         torch.save(self.state_dict(), ckpt_path)
         print(f"Checkpoint saved to {ckpt_path}")
-    
+        self._prune_old_checkpoints()
+
+    def _prune_old_checkpoints(self):
+        """Keep only the N most recent per-epoch checkpoints to bound disk usage.
+
+        Controlled by conf.keep_last_n_ckpts:
+          - N > 0  : keep the N highest-epoch e{N}.pth files, delete the rest.
+          - N <= 0 : keep everything (previous unbounded behaviour).
+
+        Only files matching e<digits>.pth are considered. final_model.pth and any
+        other named checkpoints are never touched. getattr fallback to 0 means old
+        conf.pkl files (without the key) retain keep-all behaviour.
+
+        Motivation: a 30L w256 checkpoint is ~370 MB. With save_val_ckpt=True and
+        val_freq=1 the old code wrote one per epoch and never deleted them — ~18 GB
+        per 50-epoch run, which repeatedly filled the shared 2 TB disk and crashed
+        training mid-checkpoint-write.
+        """
+        keep_n = int(getattr(self.conf, 'keep_last_n_ckpts', 0))
+        if keep_n <= 0:
+            return
+        import re
+        ckpt_dir = self.conf.ckpt_dir
+        pat = re.compile(r'^e(\d+)\.pth$')
+        epoch_ckpts = [(int(m.group(1)), f)
+                       for f in os.listdir(ckpt_dir)
+                       if (m := pat.match(f))]
+        if len(epoch_ckpts) <= keep_n:
+            return
+        epoch_ckpts.sort(key=lambda t: t[0])           # ascending by epoch number
+        to_delete = epoch_ckpts[:-keep_n]              # everything except the last N
+        for _, fname in to_delete:
+            try:
+                os.remove(os.path.join(ckpt_dir, fname))
+            except OSError as e:
+                print(f"[ckpt] WARNING: could not remove {fname}: {e}")
+        print(f"[ckpt] pruned {len(to_delete)} old checkpoint(s), keeping last {keep_n}")
+
+
     def load_checkpoint(self, ckpt_file=None):
         if ckpt_file is None:
             ckpt_file = find_latest_checkpoint(self.conf.ckpt_dir)
