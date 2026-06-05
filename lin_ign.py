@@ -44,6 +44,7 @@ class LinearIGN(nn.Module):
         binarizer_kwargs = dict(
             binarizer=getattr(self.conf, 'binarizer', 'rotation'),
             gumbel_tau=getattr(self.conf, 'gumbel_tau', 0.5),
+            rotation_beta=getattr(self.conf, 'rotation_beta', 1.0),
         )
         if operator_type == 'diagonal':
             self.A = IdempotentDiagonalOperator(input_dim, **binarizer_kwargs)

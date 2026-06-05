@@ -5,7 +5,7 @@ import random
 import torch
 import numpy as np
 import pickle
-from utils import create_experiment_dirs_ign, make_ign_inputs
+from utils import create_experiment_dirs_ign, make_ign_inputs, make_celeba_inputs
 from lin_ign import LinearIGN
 from data import get_data_loaders
 from torchvision.utils import save_image
@@ -73,6 +73,15 @@ def main():
     parser.add_argument("--binarizer", type=str, choices=['rotation', 'ste', 'gumbel'], default='rotation',
                         help="Gradient estimator for the binary diagonal A. 'rotation' = current default (RotationTrickEstimator). 'ste' = plain straight-through. 'gumbel' = Gumbel-sigmoid + STE.")
     parser.add_argument("--gumbel_tau", type=float, default=0.5, help="Temperature for the gumbel binarizer (ignored for ste/rotation).")
+    parser.add_argument("--rotation_beta", type=float, default=1.0,
+                        help="Exponent on the rotation trick's magnitude-scaling sparsity "
+                             "regularizer (only affects --binarizer rotation). The implicit "
+                             "regularizer is (norm_disc/norm_cont)**beta in the backward pass. "
+                             "1.0 = original paper behaviour. <1 = WEAKER sparsity pressure -> "
+                             "holds A_active HIGHER (more active dims, more detail/capacity; try "
+                             "0.5). >1 = STRONGER sparsity -> lower A_active. 0 = no scaling -> A "
+                             "drifts toward identity (pass-through). Use <1 to counter the "
+                             "A_active collapse seen late in CelebA training.")
     parser.add_argument("--a_operator", type=str, default="diagonal",
                         choices=["diagonal", "projection"],
                         help="Form of the idempotent operator A. "
@@ -188,6 +197,42 @@ def main():
         final_ckpt_path = os.path.join(conf.ckpt_dir, "final_model.pth")
         torch.save(model.state_dict(), final_ckpt_path)
         print(f"Training complete. Final model saved to '{final_ckpt_path}'.")
+
+    elif conf.mode == "test" and conf.im_shape[0] == 3:
+        # ---- CelebA / RGB test-mode: corrupted-input projection ----
+        # Feeds crafted/corrupted faces (clean, blur, noise, occlusion, low-res,
+        # pure noise — see utils.make_celeba_inputs) through f and saves a 2-row
+        # grid: inputs on top, f(inputs) on the bottom. Inputs are already in the
+        # normalized model range; denorm only for display. Handles any 3-channel
+        # dataset; the MNIST/1-channel path is the unchanged branch below.
+        from data import get_denormalize_fn
+        from torchvision.utils import make_grid, save_image
+        denorm = get_denormalize_fn(conf.dataset)
+        train_loader, _ = get_data_loaders(
+            conf.dataset, conf.batch_size, conf.val_batch_size,
+            conf.orig_im_size, conf.target_im_size,
+        )
+        out_dir = os.path.join(exp_dir, "free_inputs")
+        os.makedirs(out_dir, exist_ok=True)
+        model.eval()
+        for ind in range(20):
+            inputs = make_celeba_inputs(
+                train_loader, size=conf.target_im_size,
+                noise_sigma=getattr(conf, 'noise_sigma', 0.5),
+            )
+            names, tensors = zip(*inputs.items())
+            X = torch.cat(tensors, dim=0).to(conf.device)
+            with torch.no_grad():
+                Y = model(X)
+            n = X.shape[0]
+            grid_in = make_grid(denorm(X.cpu()).clamp(0, 1), nrow=n, padding=2)
+            grid_out = make_grid(denorm(Y.cpu()).clamp(0, 1), nrow=n, padding=2)
+            grid = torch.cat([grid_in, grid_out], dim=1)
+            save_path = os.path.join(out_dir, f"ign_res_{ind}.png")
+            save_image(grid, save_path)
+            with open(os.path.join(out_dir, "order.txt"), "w") as f:
+                f.write("\n".join([f"{i:02d}: {name}" for i, name in enumerate(names)]))
+            print(f"[test] saved grid to {save_path}")
 
     elif conf.mode == "test":
 
