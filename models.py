@@ -348,23 +348,40 @@ class InvCNNNet(nn.Module):
 # hidden_chans must be divisible by 16 since the periphery layers use
 # hidden_chans // 16 channels.
 class CNNBlock(nn.Module):
-    def __init__(self, hidden_chans=128, in_chans=2, k_sz=2, bias=True):
+    def __init__(self, hidden_chans=128, in_chans=2, k_sz=4, bias=True):
         super().__init__()
         assert hidden_chans % 16 == 0, f"hidden_chans must be divisible by 16, got {hidden_chans}"
         h1 = hidden_chans // 16  # 8 at default
         h2 = hidden_chans // 4   # 32 at default
         h3 = hidden_chans        # 128 at default
         h4 = hidden_chans * 4    # 512 at default
-        self.layer_1 = (nn.Conv2d(in_chans, h1, k_sz, 2, 0, bias=bias))
-        self.layer_2 = (nn.Conv2d(h1, h2, k_sz, 2, 0, bias=bias))
+        # Convolutions use kernel=4, stride=2, padding=1 — OVERLAPPING windows.
+        # Previously kernel=2, stride=2, padding=0 (non-overlapping): each output
+        # pixel saw a disjoint 2x2 input block, making the whole encoder a strict
+        # quadtree. Information never crossed the coarsest (bottleneck) split, so
+        # generation from i.i.d. noise produced independent image regions — the
+        # 2x2 "four faces meeting at the center" artifact visible on CelebA
+        # (64x64 → 32x32 block input → 2x2 bottleneck → 4 sealed quadrants).
+        # MNIST was unaffected only because its 16x16 block input bottlenecks all
+        # the way to 1x1 (full global mixing, no independent regions).
+        #
+        # kernel=4/stride=2/padding=1 produces IDENTICAL spatial sizes to the old
+        # kernel=2/stride=2/padding=0 (down: 32→16→8→4→2; up: 2→4→8→16→32 — verified
+        # for both Conv2d and ConvTranspose2d), so all downstream shapes and
+        # invertibility are preserved. The only change is that each window now
+        # overlaps its neighbours by 1 px per side, letting spatial information
+        # cross quadrant boundaries and eliminating the artifact. Cost: 4x the
+        # kernel weights per conv (4x4 vs 2x2).
+        self.layer_1 = (nn.Conv2d(in_chans, h1, k_sz, 2, 1, bias=bias))
+        self.layer_2 = (nn.Conv2d(h1, h2, k_sz, 2, 1, bias=bias))
         self.bn_1 = (nn.BatchNorm2d(h2))
-        self.layer_3 = (nn.Conv2d(h2, h3, k_sz, 2, 0, bias=bias))
-        self.layer_4 = (nn.Conv2d(h3, h4, k_sz, 2, 0, bias=bias))
-        self.layer_5 = (nn.ConvTranspose2d(h4, h3, k_sz, 2, 0))
-        self.layer_6 = (nn.ConvTranspose2d(h3, h2, k_sz, 2, 0))
+        self.layer_3 = (nn.Conv2d(h2, h3, k_sz, 2, 1, bias=bias))
+        self.layer_4 = (nn.Conv2d(h3, h4, k_sz, 2, 1, bias=bias))
+        self.layer_5 = (nn.ConvTranspose2d(h4, h3, k_sz, 2, 1))
+        self.layer_6 = (nn.ConvTranspose2d(h3, h2, k_sz, 2, 1))
         self.bn_2 = (nn.BatchNorm2d(h2))
-        self.layer_7 = (nn.ConvTranspose2d(h2, h1, k_sz, 2, 0))
-        self.layer_8 = (nn.ConvTranspose2d(h1, in_chans, k_sz, 2, 0))
+        self.layer_7 = (nn.ConvTranspose2d(h2, h1, k_sz, 2, 1))
+        self.layer_8 = (nn.ConvTranspose2d(h1, in_chans, k_sz, 2, 1))
 
     def forward(self, x):
         x1 = self.layer_1(x)
