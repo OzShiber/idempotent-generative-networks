@@ -434,7 +434,14 @@ class ActNorm2d(nn.Module):
         super().__init__()
         self.bias = nn.Parameter(torch.zeros(1, C, 1, 1))
         self.log_scale = nn.Parameter(torch.zeros(1, C, 1, 1))
-        self.initialized = False
+        # 'initialized' is a registered buffer (not a plain bool) so it is saved
+        # in the checkpoint and restored on load. Previously it was a Python bool,
+        # which meant a loaded checkpoint always came back with initialized=False —
+        # the first forward then re-ran the data-dependent _init and OVERWROTE the
+        # trained bias/log_scale with statistics of whatever batch was passed
+        # (e.g. corrupted test inputs in --mode test). As a buffer it round-trips
+        # correctly; load_checkpoint also force-sets it True after any load.
+        self.register_buffer('initialized', torch.tensor(False))
         self.eps = eps
 
     @torch.no_grad()
@@ -443,7 +450,7 @@ class ActNorm2d(nn.Module):
         std = x.std(dim=(0, 2, 3), keepdim=True) + self.eps
         self.bias.data.copy_(-mean)
         self.log_scale.data.copy_(-torch.log(std))
-        self.initialized = True
+        self.initialized.fill_(True)
 
     def forward(self, x):
         if not self.initialized:

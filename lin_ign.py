@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from models import InvTransformerNet, IdempotentDiagonalOperator, IdempotentProjectionOperator, test_model_properties, BasicLinearizer, InvCNNNet
+from models import InvTransformerNet, IdempotentDiagonalOperator, IdempotentProjectionOperator, test_model_properties, BasicLinearizer, InvCNNNet, ActNorm2d
 from torchvision.utils import make_grid
 from utils import imwrite, find_latest_checkpoint
 from data import get_denormalize_fn
@@ -561,7 +561,19 @@ class LinearIGN(nn.Module):
                     print(f"[load]   missing (first 5):    {incompat.missing_keys[:5]}")
                 if incompat.unexpected_keys:
                     print(f"[load]   unexpected (first 5): {incompat.unexpected_keys[:5]}")
-            print(f"Loaded checkpoint from {ckpt_file}")
+            # Force every ActNorm to 'initialized' after loading. The trained
+            # bias/log_scale are now in place; without this, ActNorm modules whose
+            # 'initialized' buffer was False (older checkpoints predating the buffer,
+            # which load as the default False under strict=False) would re-run their
+            # data-dependent init on the first forward and clobber the loaded stats
+            # with statistics of the test/resume batch. A loaded checkpoint is by
+            # definition already initialized.
+            n_actnorm = 0
+            for m in self.modules():
+                if isinstance(m, ActNorm2d):
+                    m.initialized.fill_(True)
+                    n_actnorm += 1
+            print(f"Loaded checkpoint from {ckpt_file} (marked {n_actnorm} ActNorm layers initialized)")
         except FileNotFoundError:
             print(f"Checkpoint file not found: {ckpt_file}")
     
