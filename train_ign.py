@@ -83,20 +83,47 @@ def main():
                              "drifts toward identity (pass-through). Use <1 to counter the "
                              "A_active collapse seen late in CelebA training.")
     parser.add_argument("--a_operator", type=str, default="diagonal",
-                        choices=["diagonal", "projection"],
+                        choices=["diagonal", "projection", "local_conv"],
                         help="Form of the idempotent operator A. "
                              "'diagonal' (default): A = diag(b), b in {0,1}^D — projection onto a coordinate-aligned K-dim subspace. "
                              "'projection': A = Q L Q^T, where Q is a learned orthogonal "
                              "(parametrized as a product of Householder reflections) and "
                              "L is the same binary diagonal. Lets the model learn the orientation of "
                              "its projection subspace, not just which axes to keep. Idempotent by "
-                             "construction either way. 'projection' adds n_householders * D parameters for Q.")
+                             "construction either way. 'projection' adds n_householders * D parameters for Q. "
+                             "'local_conv': M = up ∘ A_local ∘ down — strided linear conv compresses "
+                             "space into channels (64x64x3 -> 16x16x48 at stride 4), the SAME binary "
+                             "diagonal projects the channel vector at EVERY spatial location, and a "
+                             "learned transposed conv decompresses. Keeps the spatial map through the "
+                             "bottleneck instead of flattening to one global vector — targets the blur "
+                             "caused by the global operator keeping only low-frequency modes. "
+                             "Idempotent up to down∘up ≈ I; train with --lambda_opcons to enforce. "
+                             "NOTE: A_active then counts channels (of C·stride², e.g. 48), not C·H·W dims.")
     parser.add_argument("--n_householders", type=int, default=64,
                         help="Number of Householder reflections parametrizing Q for "
                              "--a_operator projection. K=D would span all of SO(D); "
                              "K << D is sufficient if Q only needs to align a few principal "
                              "directions. 64 is a sensible starting value; ignored when "
                              "--a_operator diagonal.")
+    parser.add_argument("--local_conv_stride", type=int, default=4,
+                        help="Compression factor for --a_operator local_conv: spatial resolution "
+                             "drops by this factor while channels grow by stride² (dimension-"
+                             "preserving). 4 maps 64x64x3 -> 16x16x48. H and W must be divisible "
+                             "by it. Ignored for other operators.")
+    parser.add_argument("--local_conv_kernel", type=int, default=8,
+                        help="Kernel size of the local_conv down/up convolutions. Must exceed the "
+                             "stride so windows OVERLAP (non-overlapping tilings create block "
+                             "seams — same failure as the pre-fix CNNBlock), and kernel-stride "
+                             "must be even so padding is integral. Default 8 with stride 4 = "
+                             "4px overlap per side. Ignored for other operators.")
+    parser.add_argument("--lambda_opcons", type=float, default=1.0,
+                        help="Weight for the local_conv operator-consistency loss "
+                             "‖down(up(y)) − y‖² — the term by which M² deviates from M. "
+                             "Pulls the down/up conv pair toward mutual inverses, i.e. toward "
+                             "exact idempotence of f. Only active for --a_operator local_conv "
+                             "(other operators are idempotent by construction and ignore this). "
+                             "0 disables; watch the logged 'opcons' column as the idempotence-gap "
+                             "proxy — it should fall toward ~0 during training.")
 
     # Loss weights — defaults to 0 disable each auxiliary loss; the code paths still run for instrumentation.
     parser.add_argument("--lambda_rec", type=float, default=1., help="Weight for the reconstruction loss.")

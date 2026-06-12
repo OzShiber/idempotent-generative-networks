@@ -1002,6 +1002,122 @@ class IdempotentProjectionOperator(nn.Module):
         return y_flat.view(original_shape)
 
 
+class IdempotentLocalConvOperator(nn.Module):
+    """Local idempotent operator  M = up ∘ A_local ∘ down  ("direction #6").
+
+    Replaces the GLOBAL flattened projection of IdempotentDiagonalOperator —
+    one binary mask over all C·H·W dims, which keeps a handful of global
+    low-frequency modes and is the structural source of the blur — with a
+    LOCAL one: the channel vector at every spatial location is projected by
+    the same idempotent matrix. Equivalent to a 1×1 conv whose [C', C']
+    kernel is diag(b), applied identically at all positions, so spatial
+    structure passes through the bottleneck untouched.
+
+      down  : learned strided Conv2d, strictly linear (no nonlinearity, no
+              bias). (B, C, H, W) → (B, C·s², H/s, W/s) — trades resolution
+              for channels so each location's channel vector encodes its
+              s×s neighbourhood. Kernel k > s so windows OVERLAP (same
+              lesson as the CNNBlock k4s2p1 fix — non-overlapping tilings
+              create block seams); k−s even so padding (k−s)/2 is integral.
+              Dimension count is preserved: C·H·W = (C·s²)·(H/s)·(W/s).
+      A_loc : binary diagonal on the C' channels, same binarizer machinery
+              (rotation / STE / gumbel, incl. rotation_beta) as
+              IdempotentDiagonalOperator — just acting on C' channels
+              instead of the flattened C·H·W vector. A_active diagnostics
+              therefore count "channels kept per location" out of C'
+              (48 for CelebA at stride 4), not out of 12288.
+      up    : learned ConvTranspose2d, strictly linear, shape-mirror of
+              down. Initialised with down's weights (adjoint warm start —
+              decoder = encoderᵀ; not an inverse, but starts the pair
+              aligned and the consistency loss does the rest).
+
+    Idempotence:  M² = up A (down∘up) A down = M  exactly iff down∘up = I
+    on the projected latents (A² = A holds structurally as always). down/up
+    are learned, so this holds only approximately — consistency_loss()
+    measures ‖down(M(x)) − A_loc(down(x))‖² on the current batch so training
+    can pull the pair toward mutual inverses (weight via --lambda_opcons).
+    Monitor the logged 'opcons' value: it is the idempotence gap's proxy.
+
+    Shape contract: (B, C, H, W) → (B, C, H, W); H and W divisible by stride.
+    """
+
+    def __init__(self, data_channels, stride=4, kernel_size=8,
+                 binarizer='rotation', gumbel_tau=0.5, rotation_beta=1.0):
+        super().__init__()
+        assert kernel_size > stride, (
+            f"kernel_size must exceed stride for overlapping windows "
+            f"(got k={kernel_size}, s={stride}); k == s reintroduces block seams")
+        assert (kernel_size - stride) % 2 == 0, (
+            f"kernel_size - stride must be even so padding is integral "
+            f"(got k={kernel_size}, s={stride})")
+        padding = (kernel_size - stride) // 2
+        chans = data_channels * stride ** 2
+        self.chans = chans
+        self.stride = stride
+        # bias=False keeps both maps strictly linear (an affine offset would
+        # break the M² = M algebra and the pseudo-inverse interpretation).
+        self.down = nn.Conv2d(data_channels, chans, kernel_size, stride, padding, bias=False)
+        self.up = nn.ConvTranspose2d(chans, data_channels, kernel_size, stride, padding, bias=False)
+        # Adjoint warm start: ConvTranspose2d sharing down's weight tensor
+        # computes downᵀ (the two weight shapes coincide: [chans, C, k, k]).
+        with torch.no_grad():
+            self.up.weight.copy_(self.down.weight)
+        # Channel-mask parametrization — identical to IdempotentDiagonalOperator.
+        self.logits = nn.Parameter(torch.randn(1, chans) - 2.)
+        self.binarizer = binarizer
+        self.gumbel_tau = gumbel_tau
+        self.rotation_beta = rotation_beta
+        self._last_proj = None
+        self._last_out = None
+
+    def _binarize(self, probs):
+        # Same three estimators as the global operators; kept local to this
+        # class rather than refactoring the existing operators (which stay
+        # untouched for backward compatibility).
+        if self.binarizer == 'ste':
+            return probs.round().detach() + probs - probs.detach()
+        elif self.binarizer == 'rotation':
+            return RotationTrickEstimator.apply(probs, self.rotation_beta)
+        elif self.binarizer == 'gumbel':
+            if self.training:
+                u = torch.rand_like(self.logits)
+                gumbel_noise = -torch.log(-torch.log(u + 1e-20) + 1e-20)
+            else:
+                gumbel_noise = 0.0
+            y_soft = torch.sigmoid((self.logits + gumbel_noise) / self.gumbel_tau)
+            y_hard = y_soft.round()
+            return y_hard.detach() - y_soft.detach() + y_soft
+        raise ValueError(
+            f"Unknown binarizer: {self.binarizer!r} (expected 'rotation', 'ste', or 'gumbel')")
+
+    def forward(self, x, *args, **kwargs):
+        y = self.down(x)                                  # (B, C', H/s, W/s)
+        probs = self.logits.sigmoid()
+        self.probs = probs                                # cached → A_probs_mean logging
+        self.diag = self._binarize(probs)                 # (1, C') — cached → A_active logging
+        y_proj = y * self.diag.view(1, self.chans, 1, 1)  # same mask at every location
+        out = self.up(y_proj)                             # (B, C, H, W)
+        # Cache the pair for consistency_loss(). Reusing `out` (rather than
+        # recomputing up(y_proj)) shares the graph, so the consistency
+        # gradient flows into both convs through the same activations.
+        self._last_proj = y_proj
+        self._last_out = out
+        return out
+
+    def consistency_loss(self):
+        """‖down(up(y_proj)) − y_proj‖² on the most recent forward's latents.
+
+        This is the exact term by which M² deviates from M, restricted to the
+        latents the operator actually produced for the current batch. Called
+        by train_step after the forward pass(es); the cache holds whichever
+        forward ran last in the step (the denoising pass when that path is
+        active — an equally valid constraint sample).
+        """
+        if self._last_proj is None:
+            return torch.zeros((), device=next(self.parameters()).device)
+        return F.mse_loss(self.down(self._last_out), self._last_proj)
+
+
 class IdentityMap(nn.Module):
     def forward(self, x, *args, **kwargs):
         return x

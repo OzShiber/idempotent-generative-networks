@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from models import InvTransformerNet, IdempotentDiagonalOperator, IdempotentProjectionOperator, test_model_properties, BasicLinearizer, InvCNNNet, ActNorm2d
+from models import InvTransformerNet, IdempotentDiagonalOperator, IdempotentProjectionOperator, IdempotentLocalConvOperator, test_model_properties, BasicLinearizer, InvCNNNet, ActNorm2d
 from torchvision.utils import make_grid
 from utils import imwrite, find_latest_checkpoint
 from data import get_denormalize_fn
@@ -54,9 +54,27 @@ class LinearIGN(nn.Module):
                 n_householders=getattr(self.conf, 'n_householders', 64),
                 **binarizer_kwargs,
             )
+        elif operator_type == 'local_conv':
+            # Local idempotent conv (direction #6): strided linear conv down
+            # (e.g. 64x64x3 -> 16x16x48 at stride 4), per-pixel idempotent
+            # channel projection, learned transposed conv back up. Keeps the
+            # spatial map through the bottleneck instead of flattening to one
+            # global vector — the structural fix for the global operator's blur.
+            stride = getattr(self.conf, 'local_conv_stride', 4)
+            if self.conf.im_shape[1] % stride or self.conf.im_shape[2] % stride:
+                raise ValueError(
+                    f"--a_operator local_conv requires im_shape H,W divisible by "
+                    f"local_conv_stride={stride}, got {self.conf.im_shape[1:]}.")
+            self.A = IdempotentLocalConvOperator(
+                data_channels=self.conf.im_shape[0],
+                stride=stride,
+                kernel_size=getattr(self.conf, 'local_conv_kernel', 8),
+                **binarizer_kwargs,
+            )
         else:
             raise ValueError(
-                f"Unknown a_operator: {operator_type!r} (expected 'diagonal' or 'projection')"
+                f"Unknown a_operator: {operator_type!r} "
+                f"(expected 'diagonal', 'projection', or 'local_conv')"
             )
         
         # The complete Linearizer model f(x)
@@ -193,12 +211,26 @@ class LinearIGN(nn.Module):
         else:
             loss_classifier = torch.zeros((), device=x.device)
 
+        # --- L_opcons (local_conv operator only): pulls the operator's
+        # down/up conv pair toward mutual inverses, which is the condition
+        # for M = up∘A∘down to be exactly idempotent (M² = up A (down∘up) A down).
+        # Gated on the operator exposing consistency_loss(); the diagonal and
+        # projection operators don't, so this is a structural no-op for them
+        # and for all existing configs. getattr fallback 0.0 keeps old
+        # conf.pkl files loading with unchanged behaviour.
+        lambda_opcons = getattr(self.conf, 'lambda_opcons', 0.0)
+        if lambda_opcons > 0 and hasattr(self.A, 'consistency_loss'):
+            loss_opcons = self.A.consistency_loss()
+        else:
+            loss_opcons = torch.zeros((), device=x.device)
+
         total_loss = (self.conf.lambda_rec * loss_rec +
                       self.conf.lambda_sparse * loss_sparse +
                       self.conf.lambda_tight * loss_tight +
                       self.conf.lambda_denoise * loss_denoise +
                       self.conf.lambda_feat * loss_feat +
-                      self.conf.lambda_classifier * loss_classifier)
+                      self.conf.lambda_classifier * loss_classifier +
+                      lambda_opcons * loss_opcons)
 
         self.opt.zero_grad()
         total_loss.backward()
@@ -208,7 +240,7 @@ class LinearIGN(nn.Module):
 
         return (total_loss.item(), loss_rec.item(), loss_sparse.item(),
                 loss_tight.item(), loss_denoise.item(), loss_feat.item(),
-                loss_classifier.item())
+                loss_classifier.item(), loss_opcons.item())
 
     def train_model(self, train_loader, n_epochs):
         self.opt = optim.Adam(self.parameters(), lr=self.conf.lr, weight_decay=self.conf.weight_decay)
@@ -228,7 +260,7 @@ class LinearIGN(nn.Module):
         print("--- Starting Training for LinearIGN ---")
         for epoch in range(n_epochs):
 
-            running_loss, running_rec, running_sparse, running_tight, running_denoise, running_feat, running_clf = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            running_loss, running_rec, running_sparse, running_tight, running_denoise, running_feat, running_clf, running_opcons = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
             counter = 0
             num_batches = len(train_loader)
 
@@ -236,7 +268,7 @@ class LinearIGN(nn.Module):
                 x = x.to(device)
                 z = torch.randn_like(x)
 
-                loss, loss_rec, loss_sparse, loss_tight, loss_denoise, loss_feat, loss_classifier = self.train_step(x, z)
+                loss, loss_rec, loss_sparse, loss_tight, loss_denoise, loss_feat, loss_classifier, loss_opcons = self.train_step(x, z)
 
                 B = x.shape[0]
                 counter += B
@@ -248,6 +280,7 @@ class LinearIGN(nn.Module):
                 running_denoise += loss_denoise * B
                 running_feat += loss_feat * B
                 running_clf += loss_classifier * B
+                running_opcons += loss_opcons * B
 
                 if (global_counter) % self.conf.log_freq == 0:
                     current_lr = self.opt.param_groups[0]['lr']
@@ -258,16 +291,18 @@ class LinearIGN(nn.Module):
                     avg_denoise = running_denoise / counter
                     avg_feat = running_feat / counter
                     avg_clf = running_clf / counter
+                    avg_opcons = running_opcons / counter
                     # Diagnostics on A's learned diagonal
                     A_active = self.A.diag.sum().item()        # number of dims with binary value 1
                     A_total = self.A.diag.numel()
                     A_probs_mean = self.A.probs.mean().item()  # soft fraction (sigmoid before rounding)
                     print(f"[Train] Epoch [{epoch+1}/{n_epochs}] Batch [{batch_idx+1}/{num_batches}] "
-                          f"LR: {current_lr:.6f} | Loss: {avg_loss:.4f} | Rec: {avg_rec:.4f} | Sparse: {avg_sparse:.4f} | tight: {avg_tight:.4f} | denoise: {avg_denoise:.4f} | feat: {avg_feat:.4f} | clf: {avg_clf:.4f} | A_active: {A_active:.0f}/{A_total} | A_probs_mean: {A_probs_mean:.3f}")
+                          f"LR: {current_lr:.6f} | Loss: {avg_loss:.4f} | Rec: {avg_rec:.4f} | Sparse: {avg_sparse:.4f} | tight: {avg_tight:.4f} | denoise: {avg_denoise:.4f} | feat: {avg_feat:.4f} | clf: {avg_clf:.4f} | opcons: {avg_opcons:.4f} | A_active: {A_active:.0f}/{A_total} | A_probs_mean: {A_probs_mean:.3f}")
                     metrics = {
                     'step': global_counter, 'epoch': epoch+1, 'lr': current_lr,
                     'loss': avg_loss, 'rec': avg_rec, 'sparse': avg_sparse, 'tight': avg_tight,
                     'denoise': avg_denoise, 'feat': avg_feat, 'classifier': avg_clf,
+                    'opcons': avg_opcons,
                     'A_active': A_active, 'A_probs_mean': A_probs_mean
                     }
                     self.log_local_metrics(metrics)
@@ -281,11 +316,12 @@ class LinearIGN(nn.Module):
                             'loss_denoise': avg_denoise,
                             'loss_feat': avg_feat,
                             'loss_classifier': avg_clf,
+                            'loss_opcons': avg_opcons,
                             'A_active': A_active,
                             'A_probs_mean': A_probs_mean
                         }, step=global_counter)
                     counter = 0
-                    running_loss, running_rec, running_sparse, running_tight, running_denoise, running_feat, running_clf = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+                    running_loss, running_rec, running_sparse, running_tight, running_denoise, running_feat, running_clf, running_opcons = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
             
             if (epoch + 1) % self.conf.val_freq == 0:
                 self.valid(epoch)
