@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from models import InvTransformerNet, IdempotentDiagonalOperator, IdempotentProjectionOperator, IdempotentLocalConvOperator, test_model_properties, BasicLinearizer, InvCNNNet, ActNorm2d
 from torchvision.utils import make_grid
-from utils import imwrite, find_latest_checkpoint
+from utils import imwrite, find_latest_checkpoint, make_degradations
 from data import get_denormalize_fn
 import wandb
 from song__unet import creat_song_unet
@@ -69,6 +69,7 @@ class LinearIGN(nn.Module):
                 data_channels=self.conf.im_shape[0],
                 stride=stride,
                 kernel_size=getattr(self.conf, 'local_conv_kernel', 8),
+                topk=getattr(self.conf, 'local_conv_topk', 0),
                 **binarizer_kwargs,
             )
         else:
@@ -143,12 +144,24 @@ class LinearIGN(nn.Module):
         eps = 1e-8
         loss_tight = ((gx_var + eps).log() - (ref_var + eps).log()).pow(2)
 
-        # --- L_denoise: f(x + sigma*z) should match x. Direct projection signal
-        # for f when fed non-real inputs. Empirically not strong enough on its own
-        # to drive useful generation; lambda_denoise=0 by default.
-        x_noisy = (x + self.conf.noise_sigma * z).clamp(-1, 1)
-        fx_noisy = self(x_noisy)
-        loss_denoise = torch.nn.functional.l1_loss(fx_noisy, x)
+        # --- L_denoise / L_restore: f(corrupted_x) should match the clean x.
+        # Direct projection signal for f on non-real inputs, and (with the
+        # mixture mode) the actual blind-restoration training objective.
+        # The corruption depends on conf.degradation_mode:
+        #   'noise'   (default): x + sigma*z — additive Gaussian only, the
+        #             original L_denoise. Preserves all existing behaviour.
+        #   'mixture': a random mix of noise / blur / occlusion / downsample
+        #             (utils.make_degradations) — trains restoration of ANY
+        #             corruption directly rather than hoping it emerges from
+        #             clean reconstruction. Use with --lambda_denoise > 0.
+        # Logged under the same 'denoise' column either way (getattr fallback
+        # keeps old conf.pkl files on the additive-noise path).
+        if getattr(self.conf, 'degradation_mode', 'noise') == 'mixture':
+            x_corrupt = make_degradations(x)
+        else:
+            x_corrupt = (x + self.conf.noise_sigma * z).clamp(-1, 1)
+        fx_corrupt = self(x_corrupt)
+        loss_denoise = torch.nn.functional.l1_loss(fx_corrupt, x)
 
         # --- L_feat (Option 1a, latent feature matching, detach variant):
         # match g(x) and g(f(x)) in g's latent space, in addition to matching

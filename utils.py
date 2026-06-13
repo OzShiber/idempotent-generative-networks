@@ -196,6 +196,64 @@ def make_ign_inputs(data_loader, size=32):
     return inputs
 
 
+def make_degradations(x, noise_sigma=(0.1, 0.3), blur_sigma=(1.0, 3.0),
+                      occlude_frac=0.25, lowres_factors=(2, 4)):
+    """Apply a mixture of random degradations to a batch, for restoration training.
+
+    Splits the batch into four chunks and applies one corruption family to each —
+    additive noise, Gaussian blur, square occlusion, downsample→upsample — so every
+    batch contains all four types (mixed), vectorised per chunk. The output is
+    ALIGNED with the input (chunk order preserved), so L1(f(make_degradations(x)), x)
+    is a valid clean-target restoration loss: f must invert whatever was applied.
+
+    This trains the de-anythinger objective DIRECTLY, rather than relying on it to
+    emerge from clean reconstruction. x is in the normalized model range (~[-1,1]
+    for CelebA); additive noise is clamped to it and occlusion zeroes (≈ gray after
+    denorm). Degradation strengths are sampled fresh each call so f sees a spread.
+
+    Falls back to additive noise for tiny batches (B < 4) where the 4-way split
+    would be empty.
+    """
+    import torch
+    import torch.nn.functional as F
+    import torchvision.transforms as T
+    import random
+
+    B, C, H, W = x.shape
+    if B < 4:
+        sig = random.uniform(*noise_sigma)
+        return (x + sig * torch.randn_like(x)).clamp(-1, 1)
+
+    chunks = list(x.chunk(4, dim=0))
+    out = []
+
+    # 1) Additive Gaussian noise (denoising).
+    c = chunks[0]
+    sig = random.uniform(*noise_sigma)
+    out.append((c + sig * torch.randn_like(c)).clamp(-1, 1))
+
+    # 2) Gaussian blur (deblurring).
+    c = chunks[1]
+    out.append(T.GaussianBlur(kernel_size=9, sigma=random.uniform(*blur_sigma))(c))
+
+    # 3) Square occlusion (inpainting). Random box per sample, zeroed.
+    c = chunks[2].clone()
+    oh, ow = int(H * occlude_frac), int(W * occlude_frac)
+    for i in range(c.shape[0]):
+        top = random.randint(0, max(H - oh, 0))
+        left = random.randint(0, max(W - ow, 0))
+        c[i, :, top:top + oh, left:left + ow] = 0.0
+    out.append(c)
+
+    # 4) Downsample then upsample (super-resolution-like recovery).
+    c = chunks[3]
+    f = random.choice(lowres_factors)
+    lr = F.interpolate(c, scale_factor=1.0 / f, mode='bilinear', align_corners=False)
+    out.append(F.interpolate(lr, size=(H, W), mode='bilinear', align_corners=False))
+
+    return torch.cat(out, dim=0)
+
+
 def make_celeba_inputs(data_loader, size=64, noise_sigma=0.5):
     """Build crafted/corrupted CelebA inputs for test-mode projection.
 

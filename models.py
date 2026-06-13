@@ -1041,7 +1041,7 @@ class IdempotentLocalConvOperator(nn.Module):
     Shape contract: (B, C, H, W) → (B, C, H, W); H and W divisible by stride.
     """
 
-    def __init__(self, data_channels, stride=4, kernel_size=8,
+    def __init__(self, data_channels, stride=4, kernel_size=8, topk=0,
                  binarizer='rotation', gumbel_tau=0.5, rotation_beta=1.0):
         super().__init__()
         assert kernel_size > stride, (
@@ -1067,6 +1067,12 @@ class IdempotentLocalConvOperator(nn.Module):
         self.binarizer = binarizer
         self.gumbel_tau = gumbel_tau
         self.rotation_beta = rotation_beta
+        # topk > 0 fixes A_active = topk channels exactly (hard top-K + STE),
+        # overriding the soft binarizer. The rotation trick drifts A_active to
+        # the floor (~1-2 of 48) on this operator; top-K pins it at a chosen K
+        # so the manifold gets a controllable, larger channel budget for finer
+        # restoration. 0 (default) keeps the normal binarizer untouched.
+        self.topk = int(topk)
         self._last_proj = None
         self._last_out = None
 
@@ -1074,6 +1080,13 @@ class IdempotentLocalConvOperator(nn.Module):
         # Same three estimators as the global operators; kept local to this
         # class rather than refactoring the existing operators (which stay
         # untouched for backward compatibility).
+        if self.topk > 0:
+            # Hard top-K: forward keeps the K highest-prob channels (mask of
+            # exactly K ones), backward is straight-through to all logits.
+            k = min(self.topk, probs.shape[-1])
+            idx = probs.topk(k, dim=-1).indices
+            hard = torch.zeros_like(probs).scatter(-1, idx, 1.0)
+            return hard + (probs - probs.detach())   # value=hard, grad→probs (STE)
         if self.binarizer == 'ste':
             return probs.round().detach() + probs - probs.detach()
         elif self.binarizer == 'rotation':

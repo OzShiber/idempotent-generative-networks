@@ -116,6 +116,14 @@ def main():
                              "seams — same failure as the pre-fix CNNBlock), and kernel-stride "
                              "must be even so padding is integral. Default 8 with stride 4 = "
                              "4px overlap per side. Ignored for other operators.")
+    parser.add_argument("--local_conv_topk", type=int, default=0,
+                        help="For --a_operator local_conv only: fix A_active to exactly this many "
+                             "channels via hard top-K (+ straight-through), overriding the soft "
+                             "binarizer. The rotation trick drifts A_active to the floor (~1-2 of "
+                             "C·stride²=48) on this operator; top-K pins it at a chosen K so the "
+                             "manifold gets a larger, controllable channel budget for finer "
+                             "restoration detail. 0 (default) = use the normal binarizer unchanged. "
+                             "Try 8 or 16. Ignored for diagonal/projection operators.")
     parser.add_argument("--lambda_opcons", type=float, default=1.0,
                         help="Weight for the local_conv operator-consistency loss "
                              "‖down(up(y)) − y‖² — the term by which M² deviates from M. "
@@ -129,8 +137,17 @@ def main():
     parser.add_argument("--lambda_rec", type=float, default=1., help="Weight for the reconstruction loss.")
     parser.add_argument("--lambda_sparse", type=float, default=0.0, help="Weight for the A sparsity loss. 0 = disabled (loss still computed and logged).")
     parser.add_argument("--lambda_tight", type=float, default=0.0, help="Weight for the A tightness loss. 0 = disabled (loss still computed and logged).")
-    parser.add_argument("--lambda_denoise", type=float, default=0.0, help="Weight for the noisy-reconstruction (denoising) loss. 0 = disabled (loss still computed and logged).")
-    parser.add_argument("--noise_sigma", type=float, default=0.3, help="Noise std added to x for the denoising loss.")
+    parser.add_argument("--lambda_denoise", type=float, default=0.0, help="Weight for the noisy/corrupted-reconstruction (denoising/restoration) loss. 0 = disabled (loss still computed and logged).")
+    parser.add_argument("--noise_sigma", type=float, default=0.3, help="Noise std added to x for the denoising loss (used when --degradation_mode noise).")
+    parser.add_argument("--degradation_mode", type=str, default="noise",
+                        choices=["noise", "mixture"],
+                        help="Corruption used for the denoise/restoration loss L1(f(corrupt(x)), x). "
+                             "'noise' (default): additive Gaussian only (the original L_denoise). "
+                             "'mixture': a random mix of additive noise / blur / occlusion / "
+                             "downsample (utils.make_degradations) — trains the blind de-anythinger "
+                             "objective directly (restore ANY corruption to clean), rather than "
+                             "relying on it to emerge from clean reconstruction. Enable with "
+                             "--lambda_denoise > 0; pairs naturally with --a_operator local_conv.")
     parser.add_argument("--lambda_feat", type=float, default=0.0,
                         help="Weight for the latent-space feature-matching loss L1(g(f(x)), g(x).detach()). "
                              "Encourages f's reconstructions to match the original at a coarser, structural "
