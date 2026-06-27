@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from models import InvTransformerNet, IdempotentDiagonalOperator, IdempotentProjectionOperator, IdempotentLocalConvOperator, test_model_properties, BasicLinearizer, InvCNNNet, ActNorm2d
+from models import InvTransformerNet, IdempotentDiagonalOperator, IdempotentProjectionOperator, IdempotentLocalConvOperator, TimeDependentLoRAFlow, test_model_properties, BasicLinearizer, InvCNNNet, ActNorm2d
 from torchvision.utils import make_grid
 from utils import imwrite, find_latest_checkpoint, make_degradations
 from data import get_denormalize_fn
@@ -83,8 +83,23 @@ class LinearIGN(nn.Module):
         # The complete Linearizer model f(x)
         self.model = BasicLinearizer(self.g, self.A)
 
+        # --- Optional flow-matching GENERATION head (separate from the idempotent
+        # restoration operator A). Adapted from the Surjective Linearizer: learns a
+        # linear current that carries a noise latent g(z) to a data latent g(x),
+        # decoded via g.inverse. It is a DISTINCT operator on the SAME encoder g —
+        # restoration uses A, generation uses self.flow. Built only when
+        # --lambda_flow > 0; getattr fallback keeps every existing config untouched.
+        self.lambda_flow = getattr(self.conf, 'lambda_flow', 0.0)
+        if self.lambda_flow > 0:
+            self.flow = TimeDependentLoRAFlow(
+                dim=input_dim,                                   # = C*H*W (g is shape-preserving)
+                rank=getattr(self.conf, 'flow_rank', 256),
+            )
+        else:
+            self.flow = None
+
         # Attributes for compatibility with test_model_properties
-        self.gx = self.gy = self.g 
+        self.gx = self.gy = self.g
         self.rgb = (self.conf.im_shape[0] == 3)
 
         # Fixed noise for consistent validation visuals
@@ -239,13 +254,33 @@ class LinearIGN(nn.Module):
         else:
             loss_opcons = torch.zeros((), device=x.device)
 
+        # --- L_flow (GENERATION head): conditional flow matching in g's latent.
+        # Interpolate g_xt between a noise latent g(z) and the data latent g(x),
+        # and train self.flow to predict the data endpoint. CRITICAL design choice:
+        # the latents fed here are DETACHED, so this loss trains ONLY the flow
+        # operator — g (and thus the idempotent restoration path) is a fixed target
+        # and cannot be harmed by the generation objective. This cleanly separates
+        # the two tasks (restoration vs generation) on the shared encoder. Cost:
+        # one extra g forward on the noise. Disabled unless --lambda_flow > 0.
+        if self.lambda_flow > 0 and self.flow is not None:
+            t = torch.rand(x.shape[0], device=x.device)
+            g_x0 = self.g(z).detach()              # noise latent (z ~ N(0,1) image-space)
+            g_x1 = gx.detach()                     # data latent g(x), already computed
+            tt = t.view(-1, 1, 1, 1)
+            g_xt = (1.0 - tt) * g_x0 + tt * g_x1   # straight-line interpolation
+            g_x1_pred = self.flow(g_xt, t)         # endpoint prediction
+            loss_flow = torch.nn.functional.mse_loss(g_x1_pred, g_x1)
+        else:
+            loss_flow = torch.zeros((), device=x.device)
+
         total_loss = (self.conf.lambda_rec * loss_rec +
                       self.conf.lambda_sparse * loss_sparse +
                       self.conf.lambda_tight * loss_tight +
                       self.conf.lambda_denoise * loss_denoise +
                       self.conf.lambda_feat * loss_feat +
                       self.conf.lambda_classifier * loss_classifier +
-                      lambda_opcons * loss_opcons)
+                      lambda_opcons * loss_opcons +
+                      self.lambda_flow * loss_flow)
 
         self.opt.zero_grad()
         total_loss.backward()
@@ -255,7 +290,30 @@ class LinearIGN(nn.Module):
 
         return (total_loss.item(), loss_rec.item(), loss_sparse.item(),
                 loss_tight.item(), loss_denoise.item(), loss_feat.item(),
-                loss_classifier.item(), loss_opcons.item())
+                loss_classifier.item(), loss_opcons.item(), loss_flow.item())
+
+    @torch.no_grad()
+    def generate(self, n_samples=16, steps=100):
+        """Flow-matching generation: integrate the learned current from a noise
+        latent to a data latent, then decode via g.inverse. Returns images in the
+        normalized model range, or None if the flow head isn't built
+        (--lambda_flow == 0). Euler integration of v = (A(g_x,t) - g_x)/(1-t)."""
+        if self.flow is None:
+            return None
+        was_training = self.training
+        self.eval()
+        device = self.device()
+        g_x = self.g(torch.randn(n_samples, *self.conf.im_shape, device=device))
+        dt = 1.0 / steps
+        for i in range(steps - 1):
+            t = torch.full((n_samples,), i * dt, device=device)
+            pred = self.flow(g_x, t)
+            v = (pred - g_x) / (1.0 - t).view(-1, 1, 1, 1)
+            g_x = g_x + v * dt
+        img = self.g.inverse(g_x)
+        if was_training:
+            self.train()
+        return img
 
     def train_model(self, train_loader, n_epochs):
         self.opt = optim.Adam(self.parameters(), lr=self.conf.lr, weight_decay=self.conf.weight_decay)
@@ -275,7 +333,7 @@ class LinearIGN(nn.Module):
         print("--- Starting Training for LinearIGN ---")
         for epoch in range(n_epochs):
 
-            running_loss, running_rec, running_sparse, running_tight, running_denoise, running_feat, running_clf, running_opcons = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            running_loss, running_rec, running_sparse, running_tight, running_denoise, running_feat, running_clf, running_opcons, running_flow = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
             counter = 0
             num_batches = len(train_loader)
 
@@ -283,7 +341,7 @@ class LinearIGN(nn.Module):
                 x = x.to(device)
                 z = torch.randn_like(x)
 
-                loss, loss_rec, loss_sparse, loss_tight, loss_denoise, loss_feat, loss_classifier, loss_opcons = self.train_step(x, z)
+                loss, loss_rec, loss_sparse, loss_tight, loss_denoise, loss_feat, loss_classifier, loss_opcons, loss_flow = self.train_step(x, z)
 
                 B = x.shape[0]
                 counter += B
@@ -296,6 +354,7 @@ class LinearIGN(nn.Module):
                 running_feat += loss_feat * B
                 running_clf += loss_classifier * B
                 running_opcons += loss_opcons * B
+                running_flow += loss_flow * B
 
                 if (global_counter) % self.conf.log_freq == 0:
                     current_lr = self.opt.param_groups[0]['lr']
@@ -307,17 +366,18 @@ class LinearIGN(nn.Module):
                     avg_feat = running_feat / counter
                     avg_clf = running_clf / counter
                     avg_opcons = running_opcons / counter
+                    avg_flow = running_flow / counter
                     # Diagnostics on A's learned diagonal
                     A_active = self.A.diag.sum().item()        # number of dims with binary value 1
                     A_total = self.A.diag.numel()
                     A_probs_mean = self.A.probs.mean().item()  # soft fraction (sigmoid before rounding)
                     print(f"[Train] Epoch [{epoch+1}/{n_epochs}] Batch [{batch_idx+1}/{num_batches}] "
-                          f"LR: {current_lr:.6f} | Loss: {avg_loss:.4f} | Rec: {avg_rec:.4f} | Sparse: {avg_sparse:.4f} | tight: {avg_tight:.4f} | denoise: {avg_denoise:.4f} | feat: {avg_feat:.4f} | clf: {avg_clf:.4f} | opcons: {avg_opcons:.4f} | A_active: {A_active:.0f}/{A_total} | A_probs_mean: {A_probs_mean:.3f}")
+                          f"LR: {current_lr:.6f} | Loss: {avg_loss:.4f} | Rec: {avg_rec:.4f} | Sparse: {avg_sparse:.4f} | tight: {avg_tight:.4f} | denoise: {avg_denoise:.4f} | feat: {avg_feat:.4f} | clf: {avg_clf:.4f} | opcons: {avg_opcons:.4f} | flow: {avg_flow:.4f} | A_active: {A_active:.0f}/{A_total} | A_probs_mean: {A_probs_mean:.3f}")
                     metrics = {
                     'step': global_counter, 'epoch': epoch+1, 'lr': current_lr,
                     'loss': avg_loss, 'rec': avg_rec, 'sparse': avg_sparse, 'tight': avg_tight,
                     'denoise': avg_denoise, 'feat': avg_feat, 'classifier': avg_clf,
-                    'opcons': avg_opcons,
+                    'opcons': avg_opcons, 'flow': avg_flow,
                     'A_active': A_active, 'A_probs_mean': A_probs_mean
                     }
                     self.log_local_metrics(metrics)
@@ -332,11 +392,12 @@ class LinearIGN(nn.Module):
                             'loss_feat': avg_feat,
                             'loss_classifier': avg_clf,
                             'loss_opcons': avg_opcons,
+                            'loss_flow': avg_flow,
                             'A_active': A_active,
                             'A_probs_mean': A_probs_mean
                         }, step=global_counter)
                     counter = 0
-                    running_loss, running_rec, running_sparse, running_tight, running_denoise, running_feat, running_clf, running_opcons = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+                    running_loss, running_rec, running_sparse, running_tight, running_denoise, running_feat, running_clf, running_opcons, running_flow = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
             
             if (epoch + 1) % self.conf.val_freq == 0:
                 self.valid(epoch)
@@ -466,6 +527,23 @@ class LinearIGN(nn.Module):
 
         if self.conf.wandb:
             wandb.log({"Samples (z vs f(z))": wandb.Image(path), "epoch": epoch})
+
+        # Flow-matching GENERATION grid (separate from the idempotent f(z) grid
+        # above). Only when the flow head is active. Integrates the learned
+        # current from noise and decodes — this is the "generate" path, vs the
+        # "restore/project" path that produces the grid above.
+        if self.flow is not None:
+            flow_samples = self.generate(
+                n_samples=self.conf.val_batch_size,
+                steps=getattr(self.conf, 'flow_steps', 100),
+            )
+            if flow_samples is not None:
+                flow_grid = make_grid(denorm(flow_samples).clip(0, 1), nrow=self.conf.val_batch_size)
+                flow_path = os.path.join(self.conf.grid_dir, f"flow_samples_e{epoch+1}.png")
+                imwrite(flow_grid, flow_path)
+                print(f"Saved flow-generation samples to {flow_path}")
+                if self.conf.wandb:
+                    wandb.log({"Flow samples (generation)": wandb.Image(flow_path), "epoch": epoch})
 
         # Quantitative metrics — generation eval + OOD projection eval.
         # Only runs if --eval_classifier_path was provided and loaded

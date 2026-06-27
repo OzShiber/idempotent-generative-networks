@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1181,6 +1182,74 @@ class IdempotentLocalConvOperator(nn.Module):
         if self._last_proj is None:
             return torch.zeros((), device=next(self.parameters()).device)
         return F.mse_loss(self.down(self._last_out), self._last_proj)
+
+
+class SinusoidalPosEmb(nn.Module):
+    """Maps a scalar timestep [B] to a sinusoidal embedding [B, dim]."""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, t):
+        device = t.device
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = t[:, None] * emb[None, :]
+        return torch.cat((emb.sin(), emb.cos()), dim=-1)
+
+
+class TimeDependentLoRAFlow(nn.Module):
+    """Flow-matching endpoint operator for GENERATION (adapted from the Surjective
+    Linearizer's TimeDependentLoRALinearLayer, Berman/Hallak/Shocher 2025).
+
+    Predicts the data-latent endpoint g_x1 from an interpolated latent g_xt and a
+    timestep t, LINEARLY in g_xt:
+
+        A(t) = I + U · diag(w(t)) · Vᵀ ,     pred = g_xt @ A(t)ᵀ
+
+    U, V ∈ R^{D×r} are learned; w(t) ∈ R^r comes from a small time MLP. Linearity
+    in g_xt is what lets the whole flow ODE collapse to one matrix at inference
+    (the "Linearizer" one-step property). The identity term makes it a residual
+    flow (predict the input plus a low-rank, time-modulated correction), and the
+    zero-init of w(t) starts A(t) = I (pred = g_xt) for a stable start.
+
+    Why this fixed-subspace form rather than the original (which generates U,V
+    directly from t): the IGN's latent is the FULL uncompressed g-output
+    (D = C·H·W = 12288 for CelebA). Generating D·r factors from t every step would
+    be ~100M params; here U,V are learned once (D·r each) and only the r singular
+    values depend on t. The trade-off is a fixed r-dim correction subspace — a
+    compressed latent (e.g. an SPNN encoder) would allow the fully-flexible form.
+
+    Cost is O(D·r); the D×D matrix is never formed.
+    """
+
+    def __init__(self, dim, rank=256, t_size=64):
+        super().__init__()
+        self.dim = dim
+        self.rank = rank
+        scale = 1.0 / (dim ** 0.5)
+        self.U = nn.Parameter(torch.randn(dim, rank) * scale)
+        self.V = nn.Parameter(torch.randn(dim, rank) * scale)
+        time_dim = t_size * 4
+        self.w_net = nn.Sequential(
+            SinusoidalPosEmb(t_size),
+            nn.Linear(t_size, time_dim), nn.GELU(),
+            nn.Linear(time_dim, time_dim), nn.GELU(),
+            nn.Linear(time_dim, rank),
+        )
+        # Zero-init final layer → w(0)=0 → A(t)=I → pred=g_xt at start (stable).
+        nn.init.zeros_(self.w_net[-1].weight)
+        nn.init.zeros_(self.w_net[-1].bias)
+
+    def forward(self, x, t):
+        """x: (B, *latent) endpoint-predict from g_xt; t: (B,) in [0,1]."""
+        shape = x.shape
+        xf = x.reshape(x.shape[0], -1)                 # (B, D)
+        w = self.w_net(t)                              # (B, r)
+        corr = ((xf @ self.U) * w) @ self.V.t()        # (B, D) low-rank, time-modulated
+        return (xf + corr).reshape(shape)              # residual: I + U diag(w) Vᵀ
 
 
 class IdentityMap(nn.Module):

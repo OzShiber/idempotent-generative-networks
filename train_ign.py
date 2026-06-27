@@ -167,6 +167,24 @@ def main():
                              "0 = disabled (skips the extra g forward pass; loss logged as 0). "
                              "Try 0.1 to enable; 0.05–0.5 is the sensible range. Adds ~one g forward "
                              "per training step (10–20%% slowdown depending on n_layers).")
+    parser.add_argument("--lambda_flow", type=float, default=0.0,
+                        help="Weight for the flow-matching GENERATION head (adapted from the "
+                             "Surjective Linearizer). 0 (default) = no flow head built; the model "
+                             "is the pure idempotent restorer, unchanged. > 0 adds a separate linear "
+                             "flow operator on g's latent, trained by conditional flow matching to "
+                             "carry a noise latent g(z) to a data latent g(x). The latents are "
+                             "DETACHED in this loss, so it trains ONLY the flow operator — the "
+                             "encoder g and the restoration path cannot be harmed by it. Generation "
+                             "samples are saved as flow_samples_e*.png each validation epoch. Try 1.0.")
+    parser.add_argument("--flow_rank", type=int, default=256,
+                        help="Rank of the time-dependent low-rank flow operator A(t)=I+U·diag(w(t))·Vᵀ "
+                             "(only used when --lambda_flow > 0). The flow's endpoint corrections live "
+                             "in this r-dim learned subspace of the latent; raise for more generative "
+                             "capacity/diversity at higher cost. 256 is a sensible start for CelebA.")
+    parser.add_argument("--flow_steps", type=int, default=100,
+                        help="Euler integration steps for flow-matching generation at validation "
+                             "(only used when --lambda_flow > 0). More steps = more accurate ODE "
+                             "integration, slightly slower sampling.")
     parser.add_argument("--lambda_classifier", type=float, default=0.0,
                         help="Weight for the pretrained-classifier perceptual loss "
                              "L1(D(f(x))_features, D(x)_features.detach()). Uses the FROZEN MNIST classifier "
