@@ -30,6 +30,8 @@ class LinearIGN(nn.Module):
             conf.im_shape[-1],
             hidden_chans=getattr(conf, 'hidden_chans', 128),
             data_channels=conf.im_shape[0],
+            coupling=getattr(conf, 'g_coupling', 'cnn'),
+            unet_model_channels=getattr(conf, 'unet_model_channels', 64),
         )
         #self.g = InvUnetV2(num_layers=1, in_channels=1, im_sz=32, unet_creator=creat_song_unet)
         

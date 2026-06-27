@@ -875,7 +875,10 @@ class LinearControlModule(torch.nn.Module):
 
 
 def creat_song_unet(model_channels=128, in_channels=1, out_channels=1, img_resolution=32, channel_mult=[1, 2, 2],
-                    num_blocks=4):
+                    num_blocks=4, dropout=0.1):
+    # num_blocks and dropout are now honored (num_blocks was previously hardcoded
+    # to 4). dropout MUST be passed as 0 when this UNet is used as an invertible
+    # coupling function — stochastic dropout breaks g.inverse(g(x)) = x.
     return SongUNet(img_resolution=img_resolution,
                     in_channels=in_channels,
                     out_channels=out_channels,
@@ -884,9 +887,9 @@ def creat_song_unet(model_channels=128, in_channels=1, out_channels=1, img_resol
                     model_channels=model_channels,
                     channel_mult=channel_mult,
                     channel_mult_emb=4,
-                    num_blocks=4,
+                    num_blocks=num_blocks,
                     attn_resolutions=[16],
-                    dropout=0.1,
+                    dropout=dropout,
                     label_dropout=0,
                     embedding_type='positional',
                     channel_mult_noise=1,

@@ -291,7 +291,8 @@ class AttentionSubBlock(nn.Module):
 
 
 class InvCNNNet(nn.Module):
-    def __init__(self, num_layers, im_sz, hidden_chans=128, data_channels=1):
+    def __init__(self, num_layers, im_sz, hidden_chans=128, data_channels=1,
+                 coupling='cnn', unet_model_channels=64):
         super().__init__()
         # Architecture: pixel_unshuffle(2) is applied ONCE at network entry/exit.
         # This maps (B, C, H, W) → (B, 4C, H/2, W/2) and all coupling layers
@@ -313,7 +314,8 @@ class InvCNNNet(nn.Module):
         cnn_in_chans   = shuffled_chans // 2  # = 2 * data_channels, one coupling half
 
         self.blocks = nn.ModuleList([
-            InvCNNBlock(im_sz // 2, hidden_chans=hidden_chans, cnn_in_chans=cnn_in_chans)
+            InvCNNBlock(im_sz // 2, hidden_chans=hidden_chans, cnn_in_chans=cnn_in_chans,
+                        coupling=coupling, unet_model_channels=unet_model_channels)
             for _ in range(num_layers)
         ])
         self.splits = nn.ModuleList([ChannelSplit(shuffled_chans) for _ in range(num_layers)])
@@ -338,6 +340,44 @@ class InvCNNNet(nn.Module):
             Y = split.inverse(Y_1, Y_2)          # cat + undo permutation
         Y = F.pixel_shuffle(Y, 2)                # (B, C, H, W) — exit once
         return Y
+
+
+class UNetCoupling(nn.Module):
+    """Song DDPM++ UNet used as the coupling function F/G inside InvCNNBlock —
+    a much higher-capacity drop-in for CNNBlock. Maps (B, C, H, W) → (B, C, H, W).
+
+    Invertibility of g comes from the additive coupling that wraps F/G
+    (Y1 = X1 + F(X2), ...), NOT from F/G themselves, so F can be an arbitrary
+    UNet. Two correctness requirements are handled here:
+
+      - dropout = 0. The coupling inverse re-evaluates F/G; any stochasticity
+        would make g.inverse(g(x)) != x (broken reconstruction + idempotence).
+        GroupNorm — the UNet's only normalization — is deterministic, so with
+        dropout off F is fully deterministic in both train and eval mode.
+      - dummy labels. SongUNet's forward wants noise/class labels (it's built
+        for diffusion); this is a plain transform, so we feed zeros.
+
+    Heavy: each InvCNNBlock holds two of these. Use a SMALL --n_layers (≈1–4)
+    with --g_coupling unet, vs the many thin CNNBlock layers.
+    """
+
+    def __init__(self, in_chans, im_sz, model_channels=64,
+                 channel_mult=(1, 2, 2), num_blocks=2):
+        super().__init__()
+        from song__unet import creat_song_unet
+        self.unet = creat_song_unet(
+            model_channels=model_channels,
+            in_channels=in_chans,
+            out_channels=in_chans,
+            img_resolution=im_sz,
+            channel_mult=list(channel_mult),
+            num_blocks=num_blocks,
+            dropout=0.0,   # MUST be 0 — see class docstring (invertibility)
+        )
+
+    def forward(self, x):
+        dummy = torch.zeros(x.shape[0], device=x.device)
+        return self.unet(x, noise_labels=dummy, class_labels=None)
 
 
 #CNN V1 — parameterized on hidden_chans (the peak/3rd-down channel count).
@@ -465,14 +505,26 @@ class ActNorm2d(nn.Module):
 
 
 class InvCNNBlock(nn.Module):
-    def __init__(self, im_sz, hidden_chans=128, cnn_in_chans=2):
+    def __init__(self, im_sz, hidden_chans=128, cnn_in_chans=2,
+                 coupling='cnn', unet_model_channels=64):
         super().__init__()
         # cnn_in_chans = channels per coupling-network half (one half of the
         # pixel_unshuffle(2) representation). For MNIST (1 input channel):
         # cnn_in_chans=2 (= 4*1//2). For CIFAR/CelebA (3): cnn_in_chans=6 (= 4*3//2).
         # Default 2 preserves the previous MNIST-only behaviour.
-        self.F = CNNBlock(hidden_chans=hidden_chans, in_chans=cnn_in_chans)
-        self.G = CNNBlock(hidden_chans=hidden_chans, in_chans=cnn_in_chans)
+        #
+        # coupling selects the F/G function (additive coupling makes either
+        # invertible regardless of what F/G compute):
+        #   'cnn'  (default): CNNBlock — unchanged, light, many layers.
+        #   'unet': Song DDPM++ UNet (UNetCoupling) — high capacity, few layers.
+        # im_sz is the spatial resolution F/G operate at (= original/2 after the
+        # single pixel_unshuffle); only the UNet uses it (as img_resolution).
+        if coupling == 'unet':
+            self.F = UNetCoupling(cnn_in_chans, im_sz, model_channels=unet_model_channels)
+            self.G = UNetCoupling(cnn_in_chans, im_sz, model_channels=unet_model_channels)
+        else:
+            self.F = CNNBlock(hidden_chans=hidden_chans, in_chans=cnn_in_chans)
+            self.G = CNNBlock(hidden_chans=hidden_chans, in_chans=cnn_in_chans)
 
     def forward(self, X_1, X_2):
         Y_1 = (X_1 + self.F(X_2))

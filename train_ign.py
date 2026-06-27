@@ -68,6 +68,17 @@ def main():
                              "Default 128 reproduces the original (peak 512). 256 = ~2x wider, ~4x params per block. "
                              "Must be divisible by 16. Doubling triggers a noticeable GPU-memory increase; "
                              "expect to drop --batch_size from 128 to ~64 at 256 width.")
+    parser.add_argument("--g_coupling", type=str, default="cnn", choices=["cnn", "unet"],
+                        help="Coupling function inside the invertible network g. "
+                             "'cnn' (default): the CNNBlock encoder-decoder — light, use many "
+                             "--n_layers. 'unet': a Song DDPM++ UNet per coupling (UNetCoupling) — "
+                             "much higher capacity, so use FEW --n_layers (~1-4). Invertibility "
+                             "holds either way (additive coupling); the UNet runs with dropout=0 "
+                             "for that reason. The split/ActNorm/pixel-shuffle scaffold is unchanged.")
+    parser.add_argument("--unet_model_channels", type=int, default=64,
+                        help="Base channel width of the Song UNet when --g_coupling unet "
+                             "(channel_mult [1,2,2], num_blocks 2). 64 is a sensible start; "
+                             "raise for more capacity at higher memory cost. Ignored for 'cnn'.")
     parser.add_argument("--n_heads", type=int, default=4, help="Number of attention heads in g.")
     parser.add_argument("--p_sz", type=int, default=4, help="Patch size for invertible transformer g.")
     parser.add_argument("--binarizer", type=str, choices=['rotation', 'ste', 'gumbel'], default='rotation',
