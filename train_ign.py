@@ -19,8 +19,12 @@ def main():
     parser = argparse.ArgumentParser(description="Train or Test a Linear Idempotent Generative Network (IGN)")
     
     # General training arguments
-    parser.add_argument("--mode", type=str, choices=["train", "test"], default="train",
-                        help="Whether to train a new model or run test-time projections.")
+    parser.add_argument("--mode", type=str, choices=["train", "test", "prior_sample"], default="train",
+                        help="'train' a new model, 'test' = test-time projections of crafted "
+                             "inputs, 'prior_sample' = latent-prior sampling diagnostic: fit a "
+                             "Gaussian to g(x) latents of real images and decode samples — "
+                             "answers whether g's latent space supports generation at all "
+                             "(see prior_sampling.py). No training; needs --ckpt.")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use, e.g., 'cuda:0' or 'cpu'.")
     parser.add_argument("--seed", type=int, default=0,
                         help="Random seed for Python, NumPy, and PyTorch (CPU + CUDA). "
@@ -209,6 +213,18 @@ def main():
                         help="Number of samples used for quantitative eval (entropy / coverage / OOD). "
                              "Larger = more reliable but slightly more expensive at validation time.")
 
+    # --mode prior_sample only (ignored otherwise).
+    parser.add_argument("--prior_n_fit", type=int, default=4096,
+                        help="prior_sample mode: number of real images encoded through g to fit "
+                             "the latent Gaussian/PCA statistics. More = better-conditioned fit, "
+                             "slower. 4096 is plenty for a diagonal fit + rank-256 PCA.")
+    parser.add_argument("--prior_pca_rank", type=int, default=256,
+                        help="prior_sample mode: rank of the low-rank (PCA) Gaussian fitted to "
+                             "the latents, in addition to the plain diagonal fit. Also reports "
+                             "the explained-variance fraction — if it is high, the latent is "
+                             "effectively low-dimensional and a compressed-latent flow (the "
+                             "option-3 fix) has an easy target.")
+
     conf = parser.parse_args()
     print(conf)
 
@@ -270,6 +286,22 @@ def main():
         final_ckpt_path = os.path.join(conf.ckpt_dir, "final_model.pth")
         torch.save(model.state_dict(), final_ckpt_path)
         print(f"Training complete. Final model saved to '{final_ckpt_path}'.")
+
+    elif conf.mode == "prior_sample":
+        # ---- Latent-prior sampling diagnostic (generation "option 1") ----
+        # No training. Fits simple Gaussians (diagonal + low-rank PCA) to the
+        # g(x) latents of real images, decodes samples via g^-1 and g^-1(A .),
+        # and saves comparison grids + latent statistics under
+        # <exp_dir>/prior_samples/. Decides whether the generation bottleneck
+        # is the SAMPLER (flow too weak) or g's latent GEOMETRY — full
+        # rationale in prior_sampling.py. Same contract as test mode: the
+        # architecture flags must match the trained checkpoint.
+        from prior_sampling import run_prior_sampling
+        train_loader, _ = get_data_loaders(
+            conf.dataset, conf.batch_size, conf.val_batch_size,
+            conf.orig_im_size, conf.target_im_size,
+        )
+        run_prior_sampling(model, train_loader, conf)
 
     elif conf.mode == "test" and conf.im_shape[0] == 3:
         # ---- CelebA / RGB test-mode: corrupted-input projection ----
