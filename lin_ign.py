@@ -95,6 +95,21 @@ class LinearIGN(nn.Module):
                 dim=input_dim,                                   # = C*H*W (g is shape-preserving)
                 rank=getattr(self.conf, 'flow_rank', 256),
             )
+            # EMA latent-prior buffers for the flow SOURCE (--flow_source prior).
+            # The prior_sample diagnostic showed pixel-noise latents g(z) land
+            # 5-15x outside the real-latent distribution (whitened distance
+            # 5.2/15.3 vs 1.0) — which is why the v1 flow (source = g(pixel
+            # noise)) generated noise: it was asked to carry latents from a
+            # region g^-1 has never decoded. 'prior' instead draws the flow's
+            # starting latents from a running per-element Gaussian fitted to
+            # g(x) batch statistics, so the source already sits inside the
+            # data-latent region and the flow only sculpts it into the true
+            # distribution. Buffers persist in checkpoints; when loading an
+            # OLD checkpoint (no buffers -> flow_prior_inited stays False)
+            # generate() falls back to the pixel path, preserving behaviour.
+            self.register_buffer("flow_mu", torch.zeros(1, *self.conf.im_shape))
+            self.register_buffer("flow_var", torch.ones(1, *self.conf.im_shape))
+            self.register_buffer("flow_prior_inited", torch.tensor(False))
         else:
             self.flow = None
 
@@ -264,8 +279,26 @@ class LinearIGN(nn.Module):
         # one extra g forward on the noise. Disabled unless --lambda_flow > 0.
         if self.lambda_flow > 0 and self.flow is not None:
             t = torch.rand(x.shape[0], device=x.device)
-            g_x0 = self.g(z).detach()              # noise latent (z ~ N(0,1) image-space)
             g_x1 = gx.detach()                     # data latent g(x), already computed
+            if getattr(self.conf, 'flow_source', 'prior') == 'prior':
+                # Source = the running latent prior (see __init__). Update the
+                # EMA stats from this batch's data latents, then sample the
+                # flow's starting points from N(mu, var) — inside the region
+                # where real latents actually live, unlike g(pixel noise).
+                with torch.no_grad():
+                    bm = g_x1.mean(0, keepdim=True)
+                    bv = g_x1.var(0, unbiased=False, keepdim=True)
+                    if not bool(self.flow_prior_inited):
+                        self.flow_mu.copy_(bm)
+                        self.flow_var.copy_(bv)
+                        self.flow_prior_inited.fill_(True)
+                    else:
+                        m = 0.995
+                        self.flow_mu.mul_(m).add_(bm, alpha=1 - m)
+                        self.flow_var.mul_(m).add_(bv, alpha=1 - m)
+                g_x0 = self.flow_mu + self.flow_var.clamp_min(1e-8).sqrt() * torch.randn_like(g_x1)
+            else:
+                g_x0 = self.g(z).detach()          # v1 behaviour: pixel-noise latent
             tt = t.view(-1, 1, 1, 1)
             g_xt = (1.0 - tt) * g_x0 + tt * g_x1   # straight-line interpolation
             g_x1_pred = self.flow(g_xt, t)         # endpoint prediction
@@ -297,13 +330,24 @@ class LinearIGN(nn.Module):
         """Flow-matching generation: integrate the learned current from a noise
         latent to a data latent, then decode via g.inverse. Returns images in the
         normalized model range, or None if the flow head isn't built
-        (--lambda_flow == 0). Euler integration of v = (A(g_x,t) - g_x)/(1-t)."""
+        (--lambda_flow == 0). Euler integration of v = (A(g_x,t) - g_x)/(1-t).
+
+        The starting latent depends on --flow_source: 'prior' (default) samples
+        the EMA latent prior maintained during training (see train_step) at
+        temperature --flow_temp; 'pixel' — or a checkpoint whose prior buffers
+        were never populated — falls back to encoding pixel noise (v1)."""
         if self.flow is None:
             return None
         was_training = self.training
         self.eval()
         device = self.device()
-        g_x = self.g(torch.randn(n_samples, *self.conf.im_shape, device=device))
+        if (getattr(self.conf, 'flow_source', 'prior') == 'prior'
+                and bool(self.flow_prior_inited)):
+            temp = float(getattr(self.conf, 'flow_temp', 1.0))
+            g_x = self.flow_mu + temp * self.flow_var.clamp_min(1e-8).sqrt() * \
+                torch.randn(n_samples, *self.conf.im_shape, device=device)
+        else:
+            g_x = self.g(torch.randn(n_samples, *self.conf.im_shape, device=device))
         dt = 1.0 / steps
         for i in range(steps - 1):
             t = torch.full((n_samples,), i * dt, device=device)

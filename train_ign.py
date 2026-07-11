@@ -19,12 +19,15 @@ def main():
     parser = argparse.ArgumentParser(description="Train or Test a Linear Idempotent Generative Network (IGN)")
     
     # General training arguments
-    parser.add_argument("--mode", type=str, choices=["train", "test", "prior_sample"], default="train",
+    parser.add_argument("--mode", type=str, choices=["train", "test", "prior_sample", "prior_gen"], default="train",
                         help="'train' a new model, 'test' = test-time projections of crafted "
                              "inputs, 'prior_sample' = latent-prior sampling diagnostic: fit a "
                              "Gaussian to g(x) latents of real images and decode samples — "
                              "answers whether g's latent space supports generation at all "
-                             "(see prior_sampling.py). No training; needs --ckpt.")
+                             "(see prior_sampling.py). 'prior_gen' = latent-prior GENERATION: "
+                             "fit the low-rank prior, sample sheets at several temperatures, "
+                             "and score with FID vs the old f(z) path and the real-vs-real "
+                             "floor (see prior_generation.py). Both need --ckpt; no training.")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use, e.g., 'cuda:0' or 'cpu'.")
     parser.add_argument("--seed", type=int, default=0,
                         help="Random seed for Python, NumPy, and PyTorch (CPU + CUDA). "
@@ -189,6 +192,20 @@ def main():
                         help="Euler integration steps for flow-matching generation at validation "
                              "(only used when --lambda_flow > 0). More steps = more accurate ODE "
                              "integration, slightly slower sampling.")
+    parser.add_argument("--flow_source", type=str, choices=["prior", "pixel"], default="prior",
+                        help="Where the flow's STARTING latents come from (only with --lambda_flow "
+                             "> 0). 'prior' (default): sample a running EMA Gaussian fitted to the "
+                             "data latents g(x) during training — the fix motivated by the "
+                             "prior_sample diagnostic, which showed pixel-noise latents g(z) land "
+                             "5-15x outside the real-latent distribution (that mismatch is why the "
+                             "v1 flow generated noise). 'pixel': the v1 behaviour, g(z) of pixel "
+                             "noise — kept for A/B comparison. Old checkpoints without the prior "
+                             "buffers automatically fall back to 'pixel' at generation time.")
+    parser.add_argument("--flow_temp", type=float, default=1.0,
+                        help="Sampling temperature for the flow's prior source at generation time "
+                             "(only with --flow_source prior). <1 shrinks samples toward the latent "
+                             "mean — Glow-style fidelity/diversity trade-off. Try 0.85 if flow "
+                             "samples look noisy.")
     parser.add_argument("--lambda_classifier", type=float, default=0.0,
                         help="Weight for the pretrained-classifier perceptual loss "
                              "L1(D(f(x))_features, D(x)_features.detach()). Uses the FROZEN MNIST classifier "
@@ -219,11 +236,19 @@ def main():
                              "the latent Gaussian/PCA statistics. More = better-conditioned fit, "
                              "slower. 4096 is plenty for a diagonal fit + rank-256 PCA.")
     parser.add_argument("--prior_pca_rank", type=int, default=256,
-                        help="prior_sample mode: rank of the low-rank (PCA) Gaussian fitted to "
-                             "the latents, in addition to the plain diagonal fit. Also reports "
-                             "the explained-variance fraction — if it is high, the latent is "
-                             "effectively low-dimensional and a compressed-latent flow (the "
-                             "option-3 fix) has an easy target.")
+                        help="prior_sample/prior_gen modes: rank of the low-rank (PCA) Gaussian "
+                             "fitted to the latents. prior_sample also reports the explained-"
+                             "variance fraction — measured 0.84 at rank 256 on the combined "
+                             "CelebA run, i.e. the latent is effectively low-dimensional.")
+
+    # --mode prior_gen only (ignored otherwise).
+    parser.add_argument("--prior_gen_n_fit", type=int, default=8192,
+                        help="prior_gen mode: number of real training images encoded through g "
+                             "to fit the generation prior. More = better-conditioned fit.")
+    parser.add_argument("--prior_gen_n_fid", type=int, default=1024,
+                        help="prior_gen mode: number of samples per FID measurement (and of real "
+                             "reference images). Larger = more stable FID, slower. FID values are "
+                             "only comparable at the same n.")
 
     conf = parser.parse_args()
     print(conf)
@@ -302,6 +327,20 @@ def main():
             conf.orig_im_size, conf.target_im_size,
         )
         run_prior_sampling(model, train_loader, conf)
+
+    elif conf.mode == "prior_gen":
+        # ---- Latent-prior GENERATION (step 1 of the generation fix) ----
+        # Fits the low-rank Gaussian prior to g(x) latents, samples it at
+        # several temperatures, decodes via g^-1(A .), and scores with FID
+        # against the old f(pixel-noise) path and the real-vs-real floor.
+        # Rationale + output list in prior_generation.py. Architecture flags
+        # must match the trained checkpoint.
+        from prior_generation import run_prior_generation
+        train_loader, test_loader = get_data_loaders(
+            conf.dataset, conf.batch_size, conf.batch_size,
+            conf.orig_im_size, conf.target_im_size,
+        )
+        run_prior_generation(model, train_loader, test_loader, conf)
 
     elif conf.mode == "test" and conf.im_shape[0] == 3:
         # ---- CelebA / RGB test-mode: corrupted-input projection ----
