@@ -344,9 +344,10 @@ def main():
 
     elif conf.mode == "test" and conf.im_shape[0] == 3:
         # ---- CelebA / RGB test-mode: corrupted-input projection ----
-        # Feeds crafted/corrupted faces (clean, blur, noise, occlusion, low-res,
-        # pure noise — see utils.make_celeba_inputs) through f and saves a 2-row
-        # grid: inputs on top, f(inputs) on the bottom. Inputs are already in the
+        # Feeds crafted/corrupted faces (clean + blur/noise/low-res severity
+        # sweeps — see utils.make_celeba_inputs; occlusion and pure-pixel-noise
+        # columns were removed, generation is --mode prior_gen) through f and
+        # saves a 2-row grid: inputs on top, f(inputs) on the bottom. Inputs are already in the
         # normalized model range; denorm only for display. Handles any 3-channel
         # dataset; the MNIST/1-channel path is the unchanged branch below.
         from data import get_denormalize_fn

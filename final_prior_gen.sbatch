@@ -29,10 +29,11 @@
 set -e
 export APPTAINER_BIND="$PRJ_WORKSPACE,$HOME"
 
-# Same clean checkpoint as the restoration test (fallback: June-27 combined).
-RUN_DIR="./results/celeba_20260613_120243_celeba_30L_lc_restore_k16_st4_s0"
-if [ ! -d "$RUN_DIR/ckpts" ]; then
-    RUN_DIR="./results/celeba_20260627_205237_celeba_localconv_restore_AND_generate"
+# Same clean no-flow model as the restoration test: newest celeba_restore_clean.
+RUN_DIR=$(ls -dv ./results/*celeba_restore_clean 2>/dev/null | tail -1)
+if [ -z "$RUN_DIR" ] || [ ! -d "$RUN_DIR/ckpts" ]; then
+    echo "ERROR: no celeba_restore_clean run under ./results/ — run train_celeba_restore_clean.sbatch first (and let it sync)." >&2
+    exit 1
 fi
 CKPT="$RUN_DIR/ckpts/final_model.pth"
 if [ ! -f "$CKPT" ]; then

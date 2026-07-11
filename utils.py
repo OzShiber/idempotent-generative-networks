@@ -263,14 +263,26 @@ def make_celeba_inputs(data_loader, size=64, noise_sigma=0.5):
     what the model's forward() expects. Display code should denormalize with
     data.celeba_denormalize before saving.
 
-    Corruption families (each tests a different facet of "project onto the
-    face manifold"):
-      - real_*     : untouched test faces. Sanity check — f(real) ≈ real.
-      - blur_*     : Gaussian-blurred. Tests deblurring.
-      - noisy_*    : additive Gaussian noise. Tests denoising (the OOD eval task).
-      - occluded_* : center square zeroed (gray). Tests inpainting.
-      - lowres_*   : 4× down- then up-sampled. Tests super-resolution-like recovery.
-      - noise_*    : pure Gaussian noise. Tests generation from scratch.
+    Corruption families — each swept over three SEVERITIES, so a single grid
+    shows where restoration starts to break:
+      - real_*      : untouched test faces. Sanity check — f(real) ≈ real.
+      - blur_sig*   : Gaussian blur, sigma 1 / 2 / 3. Tests deblurring.
+      - noisy_sig*  : additive Gaussian noise at 0.4x / 0.7x / 1.0x of
+                      `noise_sigma`. Tests denoising (the OOD eval task).
+      - lowres_x*   : 2x / 4x / 8x down- then up-sampled. Tests
+                      super-resolution-like recovery.
+
+    Two families the old grid had were deliberately REMOVED:
+      - occluded_* (grey center square): filling a large hole means
+        SYNTHESIZING content, which the local operator's small receptive
+        field cannot do — the box just persisted through f. Not the
+        restoration this model targets, so it no longer appears.
+      - noise_* (pure pixel noise): f(pixel noise) is NOT the model's
+        generation path — pixel-noise latents g(z) land far outside the
+        data-latent distribution (see the prior_sample diagnostic), so f
+        passes them through as texture. Generation is tested by
+        --mode prior_gen (sample the fitted latent prior, decode), not by
+        feeding noise to f.
 
     The real source faces are pulled from the provided loader, so pass a test
     loader for held-out faces.
@@ -291,31 +303,23 @@ def make_celeba_inputs(data_loader, size=64, noise_sigma=0.5):
     for i in range(3):
         inputs[f"real_{i}"] = src(i)
 
-    # 2) Blurred.
-    blur = T.GaussianBlur(kernel_size=9, sigma=3.0)
-    for i in range(2):
-        inputs[f"blur_{i}"] = blur(src(i))
+    # 2) Blur severity sweep (fixed kernel, growing sigma).
+    for i, sig in enumerate((1.0, 2.0, 3.0)):
+        blur = T.GaussianBlur(kernel_size=9, sigma=sig)
+        inputs[f"blur_sig{sig:g}"] = blur(src(i))
 
-    # 3) Additive Gaussian noise (clamped back to the normalized range).
-    for i in range(2):
-        inputs[f"noisy_{i}"] = (src(i) + noise_sigma * torch.randn(1, 3, size, size)).clamp(-1, 1)
+    # 3) Additive-noise severity sweep (clamped back to the normalized range).
+    for i, frac in enumerate((0.4, 0.7, 1.0)):
+        sig = frac * noise_sigma
+        inputs[f"noisy_sig{sig:.2f}"] = (
+            src(i) + sig * torch.randn(1, 3, size, size)).clamp(-1, 1)
 
-    # 4) Center occlusion — zero (≈ gray after denorm) a central square.
-    for i in range(2):
-        occ = src(i)
-        s = size // 4
-        occ[:, :, s:3 * s, s:3 * s] = 0.0
-        inputs[f"occluded_{i}"] = occ
-
-    # 5) Low-res: downsample 4× then back up (loses high-frequency detail).
-    for i in range(2):
-        lr = F.interpolate(src(i), scale_factor=0.25, mode="bilinear", align_corners=False)
+    # 4) Low-res severity sweep: downsample by f, then back up.
+    for i, f_down in enumerate((2, 4, 8)):
+        lr = F.interpolate(src(i), scale_factor=1.0 / f_down,
+                           mode="bilinear", align_corners=False)
         lr = F.interpolate(lr, size=(size, size), mode="bilinear", align_corners=False)
-        inputs[f"lowres_{i}"] = lr
-
-    # 6) Pure Gaussian noise — generation from scratch.
-    for i in range(3):
-        inputs[f"noise_{i}"] = torch.randn(1, 3, size, size)
+        inputs[f"lowres_x{f_down}"] = lr
 
     return inputs
 

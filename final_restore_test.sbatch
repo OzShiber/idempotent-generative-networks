@@ -27,12 +27,13 @@
 set -e
 export APPTAINER_BIND="$PRJ_WORKSPACE,$HOME"
 
-# The clean, no-flow restoration checkpoint. If lc_restore_k16_st4 is missing
-# on this cluster, fall back to the June-27 combined run — its g+A are the same
-# restoration model and --lambda_flow 0 below drops the flow weights at load.
-RUN_DIR="./results/celeba_20260613_120243_celeba_30L_lc_restore_k16_st4_s0"
-if [ ! -d "$RUN_DIR/ckpts" ]; then
-    RUN_DIR="./results/celeba_20260627_205237_celeba_localconv_restore_AND_generate"
+# The clean no-flow model: newest celeba_restore_clean run (train it with
+# train_celeba_restore_clean.sbatch first). No silent fallback to a flow
+# checkpoint — this test is specifically for the flow-free model.
+RUN_DIR=$(ls -dv ./results/*celeba_restore_clean 2>/dev/null | tail -1)
+if [ -z "$RUN_DIR" ] || [ ! -d "$RUN_DIR/ckpts" ]; then
+    echo "ERROR: no celeba_restore_clean run under ./results/ — run train_celeba_restore_clean.sbatch first (and let it sync)." >&2
+    exit 1
 fi
 CKPT="$RUN_DIR/ckpts/final_model.pth"
 if [ ! -f "$CKPT" ]; then
